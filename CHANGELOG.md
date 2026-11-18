@@ -1,18 +1,44 @@
 # MP4 HintBox Pro - 변경사항 통합 문서
 
-> 최종 갱신 : 2026-05-02
+> 최종 갱신 : 2026-11-18
 > 제작 : EV7lab ([https://www.mp4hintbox.co.kr](https://www.mp4hintbox.co.kr))
+
+---
+
+## v2.0.9 (2026-11-18)
+
+### 배포 방식
+- 포터블(onefile) 대신 **설치형(Setup.exe)** 으로 배포. 일반판과 Tiny 판 각각 설치 파일 제공
+- 동봉 FFmpeg 를 9.0.2 essentials 빌드로 교체 (ffmpeg/ffprobe 각 222MB → 100MB)
+- 빌드: `installer\build_installer.ps1` 한 번 실행으로 두 설치 파일 생성
+
+### 버그 수정
+- GPU 트랜스코드가 항상 실패하던 문제: 최신 FFmpeg 에서 제거된 `-vsync` 대신 `-fps_mode` 사용
+- 동봉 FFmpeg 대신 PATH 의 (오래된) FFmpeg 가 쓰이던 문제: 동봉 실행파일 우선
+- 이미 faststart 인 파일을 복사하다 취소해도 "성공" 으로 처리되던 문제
+- 별도 폴더 출력 시 다른 폴더의 같은 이름 파일이 서로 덮어쓰던 문제 (`_2`, `_3` 자동 부여)
+- Windows 에서 FFmpeg/MP4Box 가 멈추면 타임아웃이 동작하지 않던 문제
+- 임시 파일을 다른 드라이브에 만들어 교체가 원자적이지 않고 디스크 여유 검사도 엉뚱한 드라이브를 보던 문제
+- Tiny: 원본 mmap 이 닫히지 않던 문제, 출력 검증 강화 (크기 / 재생 길이)
+- 메타 검사 결과가 이미 끝난 "완료" 상태를 덮어쓰던 문제
+
+### 개선
+- 완료 알림을 확인 창(alert) 대신 화면 우하단 **토스트** 로 표시, 3초 후 자동으로 사라짐
+- 상단 버튼을 [목록 관리] / [일시정지·취소] / [선택 처리·전체 처리] / [설정] 그룹으로 재배치, 단축키 툴팁 추가
+- 원본 파일의 수정 날짜 유지 (설정에서 끌 수 있음)
+- 별도 폴더/접미사 출력 시 이미 처리된 파일도 출력 위치로 복사
+- 메타 정보 검사를 전용 스레드 풀에서 수행, 큰 목록에서도 진행률 갱신이 느려지지 않음
 
 ---
 
 ## 0. 빌드 산출물 한눈에
 
-| 산출물 | 소스 | 외부 도구 동봉 | EXE 크기 (대략) | 의존성 |
+| 산출물 (v2.0.9) | 소스 | 외부 도구 동봉 | 설치 파일 크기 | 의존성 |
 |---|---|---|---|---|
-| `MP4_HintBox_Pro_v2.0.5.exe` | `mp4hint_2.0.0.py` | ffmpeg + mp4box + DLL 9종 | **~100 MB** | PyQt5 + psutil |
-| `MP4_HintBox_Pro_Tiny_v2.0.5.exe` | `mp4hint_2.0.0_tiny.py` | 없음 (순수 Python) | **~25 MB** | PyQt5 |
+| `MP4_HintBox_Pro_Setup_v2.0.9.exe` | `mp4hint_2.0.0.py` | ffmpeg + ffprobe + mp4box + DLL | **약 118 MB** | PyQt5 + psutil |
+| `MP4_HintBox_Pro_Tiny_Setup_v2.0.9.exe` | `mp4hint_2.0.0_tiny.py` | 없음 (순수 Python) | **약 27 MB** | PyQt5 |
 
-빌드 명령은 본 문서 끝의 [부록](#부록-빌드-명령어) 참조.
+v2.0.9 부터는 `installer\build_installer.ps1` 로 빌드한다. 아래 [부록](#부록-빌드-명령어) 의 명령은 v2.0.8 까지의 포터블 빌드용.
 
 ---
 
