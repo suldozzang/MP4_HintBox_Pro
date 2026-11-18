@@ -5,7 +5,7 @@ MP4 영상을 **스트리밍에 맞게 정리**해 주는 Windows 프로그램�
 RTSP 스트리밍 서버용 Hint Track 도 만들 수 있습니다.
 
 - 홈페이지: https://www.mp4hintbox.co.kr
-- 최신 버전: **v2.0.9** (2026-11-18) · 변경 내역은 [CHANGELOG.md](CHANGELOG.md)
+- 최신 버전: **v2.1.0** (2026-11-19) · 변경 내역은 [CHANGELOG.md](CHANGELOG.md)
 
 ![메인 화면](docs/screenshot_main.png)
 
@@ -29,8 +29,22 @@ RTSP 스트리밍 서버용 Hint Track 도 만들 수 있습니다.
 - 처리 결과를 ffprobe 로 검증한 뒤에만 원본을 교체, 원본 수정 날짜 유지
 - GPU 트랜스코드 (NVIDIA NVENC / Intel QSV / AMD AMF, 일반판)
 - 작업이 끝나면 화면 오른쪽 아래에 알림이 떴다가 3초 후 사라짐
+- **탐색기 우클릭 "FastStart 처리하기"**: 프로그램 창을 열지 않고 바로 처리 (아래 참고)
 
 <img src="docs/screenshot_toast.png" alt="완료 알림" width="360">
+
+## 우클릭으로 바로 FastStart
+
+탐색기에서 MP4 / M4V / MOV 파일을 선택하고 마우스 오른쪽 버튼 > **FastStart 처리하기** 를 누르면,
+프로그램 전체 창 대신 화면 오른쪽 아래에 작은 창이 떠서 파일명과 진행률만 보여 줍니다.
+모두 끝나면 완료 표시 후 저절로 닫힙니다.
+
+<img src="docs/screenshot_quick.png" alt="우클릭 FastStart 진행 창" width="380">
+
+- 여러 파일을 한꺼번에 선택해도 창 하나에 모아 차례로 처리합니다.
+- 출력 방식(덮어쓰기 / 별도 폴더 / 접미사), 수정 날짜 유지 등은 프로그램 설정을 그대로 따릅니다.
+- 이미 FastStart 가 적용된 파일은 "이미 적용됨" 으로 건너뜁니다. 실패한 파일은 이유를 볼 수 있게 창이 조금 더 오래 남습니다.
+- 설치할 때 "우클릭 메뉴 추가" 항목으로 켜고 끌 수 있습니다. Windows 11 에서는 "더 많은 옵션 표시" 안에 나타납니다.
 
 ## 다운로드와 설치
 
@@ -38,8 +52,8 @@ v2.0.9 부터 **설치형**으로 배포합니다. 설치 프로그램은 홈페
 
 | 설치 파일 | 크기 | 포함 내용 | 이런 분께 |
 |---|---|---|---|
-| `MP4_HintBox_Pro_Setup_v2.0.9.exe` | 약 118 MB | FFmpeg 9.0.2, ffprobe, MP4Box 동봉 | Hint Track, GPU 트랜스코드, 출력 검증까지 모두 필요한 경우 |
-| `MP4_HintBox_Pro_Tiny_Setup_v2.0.9.exe` | 약 27 MB | 외부 도구 없음 (순수 Python) | FastStart 만 빠르게 하고 싶은 경우 |
+| `MP4_HintBox_Pro_Setup_v2.1.0.exe` | 약 118 MB | FFmpeg 9.0.2, ffprobe, MP4Box 동봉 | Hint Track, GPU 트랜스코드, 출력 검증까지 모두 필요한 경우 |
+| `MP4_HintBox_Pro_Tiny_Setup_v2.1.0.exe` | 약 29 MB | 외부 도구 없음 (순수 Python) | FastStart 만 빠르게 하고 싶은 경우 |
 
 - Windows 10 / 11 (64비트)
 - 관리자 권한이 없으면 "현재 사용자만" 설치를 선택할 수 있습니다.
@@ -55,6 +69,7 @@ v2.0.9 부터 **설치형**으로 배포합니다. 설치 프로그램은 홈페
 | GPU 트랜스코드 | ✓ | ✗ |
 | ffprobe 출력 검증 | ✓ | 자체 구조 검증 |
 | 파일 진단 | ✓ | ✓ |
+| 우클릭 FastStart | ✓ | ✓ |
 
 ## 사용 방법
 

@@ -65,7 +65,8 @@ from PyQt5.QtWidgets import (
     QLineEdit, QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QGroupBox,
     QStyledItemDelegate, QStyle, QStyleOptionProgressBar, QMenu, QAction,
     QToolBar, QStatusBar, QFrame, QGridLayout, QRadioButton,
-    QButtonGroup, QSizePolicy, QAbstractItemView, QShortcut, QDoubleSpinBox
+    QButtonGroup, QSizePolicy, QAbstractItemView, QShortcut, QDoubleSpinBox,
+    QScrollArea
 )
 
 
@@ -73,7 +74,7 @@ from PyQt5.QtWidgets import (
 #  상수 / 메타데이터
 # =====================================================================
 APP_NAME       = "MP4 HintBox Pro"
-APP_VERSION    = "2.0.9"
+APP_VERSION    = "2.1.0"
 APP_ORG        = "EV7lab"
 APP_WEBSITE    = "https://www.mp4hintbox.co.kr"
 APP_AUTHOR     = "EV7lab"
@@ -226,6 +227,13 @@ class AppConfig:
 # =====================================================================
 #  설정 관리자 (QSettings 영구 저장)
 # =====================================================================
+def _version_tuple(v: str) -> Tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in (v or "0").split("."))
+    except ValueError:
+        return (0,)
+
+
 class SettingsManager:
     def __init__(self):
         self.q = QSettings(APP_ORG, APP_NAME)
@@ -268,6 +276,11 @@ class SettingsManager:
                 if abs(c.audio_sync_offset_sec - 0.15) < 0.001:
                     c.audio_sync_offset_sec = 0.0
                     self.q.setValue("audio_sync_offset_sec", 0.0)
+            # v2.1.0: 가속 기본값을 CPU(Stream Copy) 로. FastStart 에는 재인코딩이 필요 없고
+            # GPU 트랜스코드는 느리고 화질이 바뀌므로, 이전 버전에서 켜 둔 값도 한 번 끈다.
+            if _version_tuple(seen_version) < (2, 1, 0) and c.hw_accel_enabled:
+                c.hw_accel_enabled = False
+                self.q.setValue("hw_accel_enabled", False)
             self.q.setValue("seen_version", APP_VERSION)
 
     def save(self):
@@ -3555,6 +3568,282 @@ class MainWindow(QMainWindow):
 
 
 # =====================================================================
+#  빠른 FastStart (탐색기 우클릭 "FastStart 처리하기")
+#  - 메인 창 없이 화면 우하단에 파일명 + 진행률만 보이는 작은 창
+#  - 여러 파일을 한꺼번에 우클릭해도 창 하나에 모아서 차례로 처리 (단일 인스턴스)
+#  - 모두 끝나면 완료 표시 후 자동으로 닫힘
+# =====================================================================
+QUICK_ARG  = "--faststart"
+QUICK_EXTS = (".mp4", ".m4v", ".mov")
+
+
+class QuickRow(QFrame):
+    """파일 한 개: 파일명 / 상태 / 얇은 진행률 막대"""
+    NAME_WIDTH = 250
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("quickRow")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 4, 0, 4)
+        v.setSpacing(4)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        name = os.path.basename(path)
+        self.lbl_name = QLabel()
+        self.lbl_name.setObjectName("quickName")
+        self.lbl_name.setText(self.lbl_name.fontMetrics().elidedText(name, Qt.ElideMiddle, self.NAME_WIDTH))
+        self.lbl_name.setToolTip(path)
+        self.lbl_status = QLabel("대기")
+        self.lbl_status.setObjectName("quickStatus")
+        self.lbl_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        top.addWidget(self.lbl_name, 1)
+        top.addWidget(self.lbl_status)
+        v.addLayout(top)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(6)
+        v.addWidget(self.bar)
+
+    def set_progress(self, pct: float):
+        self.bar.setValue(int(max(0.0, min(100.0, pct)) * 10))
+        self.lbl_status.setText(f"{int(pct)}%")
+
+    def set_status(self, text: str):
+        self.lbl_status.setText(text)
+
+    def set_done(self, ok: bool, msg: str):
+        self.bar.setValue(1000)
+        if ok:
+            self.lbl_status.setText("이미 적용됨 ✓" if "이미" in msg else "완료 ✓")
+            self.lbl_status.setStyleSheet("color:#81C784;")
+            self.bar.setProperty("state", "done")
+        else:
+            self.lbl_status.setText("취소" if "취소" in msg else "실패")
+            self.lbl_status.setStyleSheet("color:#EF9A9A;")
+            self.lbl_status.setToolTip(msg)
+            self.lbl_name.setToolTip(f"{self.lbl_name.toolTip()}\n실패 이유: {msg}")
+            self.bar.setProperty("state", "fail")
+        self.bar.style().unpolish(self.bar)
+        self.bar.style().polish(self.bar)
+
+
+class QuickWindow(QWidget):
+    """우클릭 FastStart 전용 미니 창 (화면 우하단)"""
+    WIDTH = 380
+    MAX_VISIBLE_ROWS = 5
+
+    def __init__(self, make_processor: Callable[..., QRunnable]):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedWidth(self.WIDTH)
+        self._make = make_processor
+        self.cfg = SettingsManager().cfg
+        self.ctrl = ProcessController()
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)          # 디스크 경합을 피하려고 한 번에 하나씩
+        self.temp_dir = os.path.join(user_data_dir(), "temp")
+        os.makedirs(self.temp_dir, exist_ok=True)
+        self._rows: Dict[str, QuickRow] = {}
+        self._pending = 0
+        self._failed = 0
+        self._close_timer = QTimer(self)
+        self._close_timer.setSingleShot(True)
+        self._close_timer.timeout.connect(self.close)
+
+        self.setStyleSheet("""
+            QFrame#quickFrame { background:#2b2d31; border:1px solid #45484e; border-radius:8px; }
+            QLabel { color:#e8eaed; background:transparent; }
+            QLabel#quickTitle { color:#ffffff; font-weight:700; font-size:10pt; }
+            QLabel#quickName  { color:#e8eaed; font-size:9pt; }
+            QLabel#quickStatus { color:#c4c8ce; font-size:9pt; }
+            QPushButton#quickClose { color:#c4c8ce; background:transparent; border:none;
+                                     font-size:11pt; padding:0 4px; }
+            QPushButton#quickClose:hover { color:#ffffff; }
+            QProgressBar { background:#1f2125; border:none; border-radius:3px; }
+            QProgressBar::chunk { background:#FB8C00; border-radius:3px; }
+            QProgressBar[state="done"]::chunk { background:#43A047; }
+            QProgressBar[state="fail"]::chunk { background:#E35336; }
+            QScrollArea { background:transparent; border:none; }
+            QScrollArea > QWidget > QWidget { background:transparent; }
+        """)
+
+        frame = QFrame(self)
+        frame.setObjectName("quickFrame")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(frame)
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(14, 10, 10, 12)
+        v.setSpacing(4)
+
+        head = QHBoxLayout()
+        self.lbl_title = QLabel("FastStart 처리 중")
+        self.lbl_title.setObjectName("quickTitle")
+        btn_close = QPushButton("✕")
+        btn_close.setObjectName("quickClose")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.setToolTip("닫기 (진행 중이면 취소)")
+        btn_close.clicked.connect(self.close)
+        head.addWidget(self.lbl_title, 1)
+        head.addWidget(btn_close)
+        v.addLayout(head)
+
+        self._list = QWidget()
+        self._list_layout = QVBoxLayout(self._list)
+        self._list_layout.setContentsMargins(0, 0, 4, 0)
+        self._list_layout.setSpacing(2)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setWidget(self._list)
+        v.addWidget(self._scroll)
+
+    # ---- 파일 추가 ----
+    def add_files(self, paths: List[str]):
+        added = 0
+        for p in paths:
+            p = os.path.normpath(os.path.abspath(p.strip().strip('"')))
+            if not p or p in self._rows or not os.path.isfile(p) \
+                    or not p.lower().endswith(QUICK_EXTS):
+                continue
+            row = QuickRow(p)
+            self._list_layout.addWidget(row)
+            self._rows[p] = row
+            proc = self._make(p, self.cfg, self.ctrl, self.temp_dir)
+            proc.signals.progress.connect(self._on_progress)
+            proc.signals.finished.connect(self._on_finished)
+            proc.signals.log.connect(lambda msg: logger.info(f"[빠른 FastStart]   {msg}"))
+            self._pending += 1
+            added += 1
+            self.pool.start(proc)
+            logger.info(f"[빠른 FastStart] 추가: {p}")
+        if added:
+            self._close_timer.stop()
+            self._update_title()
+            self._relayout()
+
+    def has_files(self) -> bool:
+        return bool(self._rows)
+
+    # ---- 시그널 ----
+    def _on_progress(self, path: str, pct: float, _eta: float, _speed: float):
+        row = self._rows.get(path)
+        if row and pct < 100:
+            row.set_progress(pct)
+
+    def _on_finished(self, path: str, ok: bool, msg: str):
+        row = self._rows.get(path)
+        if row:
+            row.set_done(ok, msg)
+        logger.info(f"[빠른 FastStart] {'성공' if ok else '실패'}: {path} ({msg})")
+        self._pending -= 1
+        if not ok:
+            self._failed += 1
+        self._update_title()
+        if self._pending <= 0:
+            # 실패가 있으면 이유를 볼 수 있게 조금 더 오래 둔다
+            self._close_timer.start(6000 if self._failed else 2500)
+
+    def _update_title(self):
+        total = len(self._rows)
+        done = total - self._pending
+        if self._pending > 0:
+            self.lbl_title.setText(f"FastStart 처리 중 ({done}/{total})")
+        elif self._failed:
+            self.lbl_title.setText(f"완료 (실패 {self._failed}개)")
+        else:
+            self.lbl_title.setText("FastStart 완료 ✓")
+
+    # ---- 배치 ----
+    def _relayout(self):
+        rows = list(self._rows.values())
+        row_h = rows[0].sizeHint().height() + self._list_layout.spacing() if rows else 0
+        visible = min(len(rows), self.MAX_VISIBLE_ROWS)
+        self._scroll.setFixedHeight(max(1, row_h * visible + 4))
+        self.adjustSize()
+        screen = QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen else QRect(0, 0, 1280, 800)
+        self.move(area.right() - 16 - self.width(), area.bottom() - 16 - self.height())
+        if rows:
+            self._scroll.ensureWidgetVisible(rows[-1])
+
+    def closeEvent(self, e):
+        if self._pending > 0:
+            self.ctrl.cancel()                  # 진행 중이면 취소 (임시 파일은 워커가 정리)
+            self.pool.waitForDone(8000)
+        super().closeEvent(e)
+        QApplication.quit()
+
+
+def run_quick_mode(app: QApplication, files: List[str],
+                   make_processor: Callable[..., QRunnable]) -> int:
+    """우클릭으로 실행된 경우. 이미 미니 창이 떠 있으면 파일만 넘기고 끝낸다."""
+    from PyQt5.QtNetwork import QLocalServer, QLocalSocket
+    server_name = f"{APP_USER_MODEL_ID}.quick.{os.environ.get('USERNAME', 'user')}"
+    payload = "\n".join(files).encode("utf-8")
+
+    server = None
+    for _ in range(30):
+        sock = QLocalSocket()
+        sock.connectToServer(server_name)
+        if sock.waitForConnected(200):
+            # 끝 표시(\0) 를 붙여 보내고, 미니 창이 받았다는 응답(OK)을 확인한 뒤 종료
+            sock.write(payload + b"\0")
+            sock.flush()
+            sock.waitForBytesWritten(2000)
+            if sock.waitForReadyRead(3000) and bytes(sock.readAll()).startswith(b"OK"):
+                sock.disconnectFromServer()
+                return 0
+            sock.abort()
+            continue
+        srv = QLocalServer()
+        if srv.listen(server_name):
+            server = srv
+            break
+        time.sleep(0.05)                        # 동시에 여러 개가 실행된 경우 잠시 후 재시도
+
+    win = QuickWindow(make_processor)
+    if server is not None:
+        def on_new_connection():
+            while server.hasPendingConnections():
+                conn = server.nextPendingConnection()
+                buf = bytearray()
+
+                def on_ready(c=conn, b=buf):
+                    b.extend(bytes(c.readAll()))
+                    if b.endswith(b"\0"):
+                        win.add_files(bytes(b[:-1]).decode("utf-8", "ignore").splitlines())
+                        b.clear()
+                        c.write(b"OK")
+                        c.flush()
+
+                conn.readyRead.connect(on_ready)
+                conn.disconnected.connect(conn.deleteLater)
+                if conn.bytesAvailable():
+                    on_ready()
+        server.newConnection.connect(on_new_connection)
+
+    win.add_files(files)
+    if not win.has_files():
+        logger.info(f"[빠른 FastStart] 처리할 파일 없음: {files}")
+        return 0
+    win.show()
+    return app.exec_()
+
+
+def _make_quick_processor(path: str, cfg: AppConfig, ctrl: ProcessController,
+                          temp_dir: str) -> QRunnable:
+    """우클릭 처리: 항상 FastStart (Native 우선, 안 되면 FFmpeg 스트림 카피) - GPU 미사용"""
+    return FileProcessor(path, Engine.FFMPEG.value, "none", cfg, ctrl,
+                         find_executable("ffmpeg", "ffmpeg.exe"),
+                         find_executable("MP4Box", "mp4box.exe"),
+                         find_executable("ffprobe", "ffprobe.exe"), temp_dir)
+
+
+# =====================================================================
 #  진입점
 # =====================================================================
 def _load_app_icon() -> Optional[QIcon]:
@@ -3601,6 +3890,11 @@ def main():
     app_icon = _load_app_icon()
     if app_icon is not None:
         app.setWindowIcon(app_icon)
+
+    # 탐색기 우클릭 "FastStart 처리하기" → 메인 창 없이 미니 창으로 처리
+    if QUICK_ARG in sys.argv:
+        files = sys.argv[sys.argv.index(QUICK_ARG) + 1:]
+        sys.exit(run_quick_mode(app, files, _make_quick_processor))
 
     # 테마 적용 (설정 로드 후)
     sm = SettingsManager()
