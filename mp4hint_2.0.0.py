@@ -1958,6 +1958,40 @@ TEMP_PREFIX = ".mp4hb_"
 TEMP_SUFFIX = ".tmp.mp4"
 
 
+def mp4_valid_end(path: str) -> int:
+    """정상적으로 파싱되는 최상위 atom 들이 끝나는 위치.
+    파일 크기보다 작으면 그 뒤는 MP4 블록이 아닌 꼬리 데이터.
+    moov/mdat 가 모두 정상 범위에 있을 때만 값을 돌려주고, 아니면 0."""
+    try:
+        size = os.path.getsize(path)
+        end = 0
+        seen = set()
+        with open(path, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                for pos, atype, asize, _hs in MP4Reader.iter_top_atoms(mm, size):
+                    end = pos + asize
+                    seen.add(atype)
+        return end if {"moov", "mdat"} <= seen else 0
+    except Exception:
+        return 0
+
+
+def copy_prefix(src: str, dst: str, length: int, ctrl) -> bool:
+    """src 의 앞 length 바이트만 dst 로 복사. 취소되면 False."""
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        remaining = length
+        while remaining > 0:
+            if ctrl.is_cancelled():
+                return False
+            ctrl.wait_if_paused(0.2)
+            buf = fin.read(min(8 * 1024 * 1024, remaining))
+            if not buf:
+                break
+            fout.write(buf)
+            remaining -= len(buf)
+    return True
+
+
 def is_temp_artifact(name: str) -> bool:
     """처리 중 생성되는 임시 파일인지 (폴더 스캔 시 목록에서 제외)"""
     base = os.path.basename(name)
@@ -2123,6 +2157,7 @@ class FileProcessor(QRunnable):
             ok = False
             msg = ""
             verified = False
+            trimmed_path = ""
             try:
                 if use_native:
                     on_log("⚡ Native FastStart 모드 (FFmpeg 우회)")
@@ -2149,10 +2184,23 @@ class FileProcessor(QRunnable):
                     ok, msg = runner.run_ffmpeg(path, temp_out, info.duration,
                                                 self.hw_accel, on_progress, on_log)
                 else:
-                    ok, msg = runner.run_mp4box(path, temp_out, info.duration,
+                    # MP4Box 는 파일 끝의 비표준 꼬리 데이터를 '불완전한 박스'로 보고 열기를 거부함
+                    # → 꼬리를 뺀 임시 사본을 만들어 넘긴다 (원본은 건드리지 않음)
+                    mp4box_src = path
+                    valid_end = mp4_valid_end(path)
+                    if valid_end and valid_end < info.size:
+                        on_log(f"  파일 끝 비표준 데이터 {info.size - valid_end:,} bytes 감지 "
+                               f"→ 제외한 임시 사본으로 MP4Box 실행")
+                        trimmed_path = make_temp_path(final_out, self.temp_dir)
+                        if not copy_prefix(path, trimmed_path, valid_end, self.ctrl):
+                            raise RuntimeError("취소됨")
+                        mp4box_src = trimmed_path
+                    ok, msg = runner.run_mp4box(mp4box_src, temp_out, info.duration,
                                                 on_progress, on_log)
             except Exception as e:
                 ok, msg = False, f"엔진 실행 예외: {e}"
+            finally:
+                self._cleanup(trimmed_path)
 
             if self.ctrl.is_cancelled():
                 self._cleanup(temp_out)

@@ -925,6 +925,22 @@ class NativeFastStart:
                         eta = (file_size - written) / bps if bps > 0 else 0
                         on_progress(pct, eta, bps / (1024 * 1024))
 
+                # 마지막 정상 atom 뒤에 붙은 비표준 꼬리 데이터 (예: 배포처가 덧붙인 식별 문자열)
+                # 는 MP4 블록으로 해석되지 않아 위 루프에서 빠진다 → 원본 그대로 끝에 보존.
+                # 파일 끝에 붙으므로 mdat 오프셋(stco/co64)에는 영향 없음.
+                tail_start = max(a[0] + a[2] for a in atoms)
+                if tail_start < file_size:
+                    on_log(f"  파일 끝 비표준 데이터 {file_size - tail_start:,} bytes 그대로 보존")
+                    fin.seek(tail_start)
+                    while True:
+                        if ctrl.is_cancelled():
+                            return False, "취소됨"
+                        buf = fin.read(NativeFastStart.CHUNK_SIZE)
+                        if not buf:
+                            break
+                        fout.write(buf)
+                        written += len(buf)
+
             # moov 위치만 옮기므로 출력 크기는 입력과 정확히 같아야 함 (잘린 파일 등 검출)
             out_size = os.path.getsize(output_path)
             if out_size != file_size:
