@@ -38,6 +38,7 @@ import logging
 import platform
 import subprocess
 import threading
+import queue
 import mmap
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -51,7 +52,7 @@ import psutil
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QThreadPool, QRunnable, QObject, QUrl, QMutex,
     QMutexLocker, QSettings, QTimer, QSize, QRect, QEvent, pyqtSlot,
-    QSortFilterProxyModel, QRegExp
+    QSortFilterProxyModel, QRegExp, QPropertyAnimation
 )
 from PyQt5.QtGui import (
     QFont, QPainter, QPen, QColor, QPalette, QIcon, QPixmap, QBrush,
@@ -72,19 +73,23 @@ from PyQt5.QtWidgets import (
 #  상수 / 메타데이터
 # =====================================================================
 APP_NAME       = "MP4 HintBox Pro"
-APP_VERSION    = "2.0.5"
+APP_VERSION    = "2.0.9"
 APP_ORG        = "EV7lab"
 APP_WEBSITE    = "https://www.mp4hintbox.co.kr"
 APP_AUTHOR     = "EV7lab"
 APP_BUILD_YEAR = "2026"
+APP_USER_MODEL_ID = "EV7lab.MP4HintBoxPro"
 
 # 트리뷰 컬럼
 COL_NAME      = 0
-COL_SIZE      = 1
-COL_DURATION  = 2
-COL_STATUS    = 3
-COL_PROGRESS  = 4
-COL_PATH      = 5  # 경로 (숨김 데이터)
+COL_RES       = 1   # 해상도 (NEW)
+COL_CODEC     = 2   # 코덱 (NEW)
+COL_BITRATE   = 3   # 비트레이트 (NEW)
+COL_DURATION  = 4
+COL_SIZE      = 5
+COL_STATUS    = 6
+COL_PROGRESS  = 7
+COL_PATH      = 8  # 경로 (숨김 데이터)
 
 # Windows STARTUPINFO (콘솔 숨김)
 STARTUPINFO = None
@@ -118,13 +123,14 @@ def user_data_dir() -> str:
 
 
 def find_executable(name: str, fallback_local: str) -> str:
-    """PATH 에서 우선 탐색, 없으면 base_dir 내 동봉 실행파일 사용"""
-    found = shutil.which(name)
-    if found:
-        return found
+    """동봉 실행파일 우선, 없으면 PATH 에서 탐색.
+    (PATH 우선이면 사용자 PC 의 오래된 ffmpeg 가 동봉한 최신 버전 대신 쓰이는 문제가 있었음)"""
     local = os.path.join(app_base_dir(), fallback_local)
     if os.path.isfile(local):
         return local
+    found = shutil.which(name)
+    if found:
+        return found
     return fallback_local  # 못 찾아도 이름은 반환 (의존성 체크에서 잡힘)
 
 
@@ -185,6 +191,7 @@ class TaskState(Enum):
 class MediaInfo:
     duration: float = 0.0          # 초
     size: int = 0                  # 바이트
+    bit_rate: int = 0              # bps (전체 평균)
     has_faststart: bool = False
     has_hint_track: bool = False
     video_codec: str = ""
@@ -209,8 +216,10 @@ class AppConfig:
     auto_cleanup_temp: bool = True
     theme: str = "dark"                # dark / light
     native_faststart: bool = True      # FFmpeg 우회 고속 처리 (기본 ON)
-    audio_sync_offset_sec: float = 0.15  # Native 처리 시 오디오 싱크 보정 (양수=오디오 앞으로)
+    audio_sync_offset_sec: float = 0.00  # Native 처리 시 오디오 싱크 보정 (양수=오디오 앞으로)
+    flatten_video_stts: bool = False     # 비디오 stts 평탄화 (VFR → 의사 CFR, 재인코딩 X)
     show_log: bool = False             # 처리 로그 패널 표시 (기본 숨김)
+    preserve_mtime: bool = True        # 출력 파일에 원본 수정 날짜 유지
     recent_dirs: List[str] = field(default_factory=list)
 
 
@@ -242,9 +251,24 @@ class SettingsManager:
             c.audio_sync_offset_sec = float(self.q.value("audio_sync_offset_sec", c.audio_sync_offset_sec))
         except (TypeError, ValueError):
             pass
+        c.flatten_video_stts = self.q.value("flatten_video_stts", c.flatten_video_stts, bool)
         c.show_log          = self.q.value("show_log", c.show_log, bool)
-        recent              = self.q.value("recent_dirs", "", str)
+        c.preserve_mtime    = self.q.value("preserve_mtime", c.preserve_mtime, bool)
+        recent             = self.q.value("recent_dirs", "", str)
         c.recent_dirs       = [p for p in (recent or "").split("|") if p]
+
+        # ── 버전 업그레이드 마이그레이션 ──
+        # v2.0.3 ~ v2.0.5 는 audio_sync_offset_sec 의 기본값이 0.15 였음.
+        # 이는 정상 파일도 강제로 audio elst.media_time 을 +0.15s 만큼 시프트하여
+        # 오히려 싱크를 깨뜨리는 문제가 있었음. v2.0.6 부터 기본 0.0.
+        # 사용자가 0.15 로 저장된 상태이면 (옛 기본값) 0.0 으로 자동 리셋.
+        seen_version = self.q.value("seen_version", "", str)
+        if seen_version != APP_VERSION:
+            if seen_version in ("", "2.0.3", "2.0.4", "2.0.5"):
+                if abs(c.audio_sync_offset_sec - 0.15) < 0.001:
+                    c.audio_sync_offset_sec = 0.0
+                    self.q.setValue("audio_sync_offset_sec", 0.0)
+            self.q.setValue("seen_version", APP_VERSION)
 
     def save(self):
         c = self.cfg
@@ -262,7 +286,9 @@ class SettingsManager:
         self.q.setValue("theme", c.theme)
         self.q.setValue("native_faststart", c.native_faststart)
         self.q.setValue("audio_sync_offset_sec", c.audio_sync_offset_sec)
+        self.q.setValue("flatten_video_stts", c.flatten_video_stts)
         self.q.setValue("show_log", c.show_log)
+        self.q.setValue("preserve_mtime", c.preserve_mtime)
         self.q.setValue("recent_dirs", "|".join(c.recent_dirs[:10]))
         self.q.sync()
 
@@ -312,13 +338,26 @@ class Theme:
             QStatusBar { background:#26282c; }
             QMenu { background:#2a2c30; border:1px solid #444; }
             QMenu::item:selected { background:#0a4d8c; }
+            QPushButton#primary { background:#A0522D; border:1px solid #C05800;
+                                  color:#ffffff; font-weight:600; }
+            QPushButton#primary:hover { background:#B35A2F; }
+            QPushButton#primary:pressed { background:#8A4626; }
+            QPushButton#primary:disabled { background:#3a2e28; color:#9a8f88; border-color:#4a3a30; }
+            QPushButton#danger:enabled { border:1px solid #9B1313; }
+            QPushButton#danger:enabled:hover { background:#5a2a2a; }
         """)
 
     @staticmethod
     def apply_light(app: QApplication):
         app.setStyle("Fusion")
         app.setPalette(app.style().standardPalette())
-        app.setStyleSheet("")
+        app.setStyleSheet("""
+            QPushButton { padding:6px 14px; }
+            QPushButton#primary { background:#A0522D; border:1px solid #8A4626; border-radius:4px;
+                                  color:#ffffff; font-weight:600; }
+            QPushButton#primary:hover { background:#B35A2F; }
+            QPushButton#primary:disabled { background:#d9c9c0; color:#5c4f48; }
+        """)
 
 
 # =====================================================================
@@ -455,6 +494,10 @@ class MediaProbe:
                     info.duration = float(fmt.get("duration", 0) or 0)
                 except (TypeError, ValueError):
                     info.duration = 0.0
+                try:
+                    info.bit_rate = int(float(fmt.get("bit_rate", 0) or 0))
+                except (TypeError, ValueError):
+                    info.bit_rate = 0
                 for s in data.get("streams", []):
                     ct = s.get("codec_type", "")
                     if ct == "video" and not info.video_codec:
@@ -467,6 +510,9 @@ class MediaProbe:
             logger.warning(f"ffprobe 실패 ({filepath}): {e}")
         info.has_faststart  = MP4Parser.has_faststart(filepath)
         info.has_hint_track = MP4Parser.has_hint_track(filepath)
+        # ffprobe 가 bit_rate 를 못 줬으면 size/duration 로 추산
+        if info.bit_rate <= 0 and info.duration > 0 and info.size > 0:
+            info.bit_rate = int(info.size * 8 / info.duration)
         return info
 
     @staticmethod
@@ -587,9 +633,11 @@ class NativeFastStart:
                 ctrl,
                 on_progress: Callable[[float, float, float], None],
                 on_log: Callable[[str], None],
-                audio_sync_offset_sec: float = 0.0) -> Tuple[bool, str]:
+                audio_sync_offset_sec: float = 0.0,
+                flatten_video_stts: bool = False) -> Tuple[bool, str]:
         """반환: (success, message)
-           audio_sync_offset_sec: 오디오 elst.media_time 보정값 (양수=오디오 빨라짐)"""
+           audio_sync_offset_sec: 오디오 elst.media_time 보정값 (양수=오디오 빨라짐)
+           flatten_video_stts: 비디오 stts 의 모든 sample_delta 를 평균값으로 통일 (VFR→CFR)"""
         try:
             file_size = os.path.getsize(input_path)
             if file_size < 32:
@@ -631,7 +679,8 @@ class NativeFastStart:
             # 이미 faststart 인 경우
             if moov[0] < mdat[0]:
                 on_log("  native: 이미 faststart - 단순 복사")
-                NativeFastStart._copy(input_path, output_path, file_size, ctrl, on_progress)
+                if not NativeFastStart._copy(input_path, output_path, file_size, ctrl, on_progress):
+                    return False, "취소됨"
                 return True, "이미 faststart (복사 완료)"
 
             on_log(f"  native: moov={moov[2]/1024:.1f}KB @ {moov[0]} → 선두로 이동")
@@ -645,6 +694,10 @@ class NativeFastStart:
             if abs(audio_sync_offset_sec) > 0.001:
                 moov_data = NativeFastStart._apply_audio_offset(
                     moov_data, audio_sync_offset_sec, on_log)
+
+            # 비디오 stts 평탄화 (VFR → 의사 CFR, in-place)
+            if flatten_video_stts:
+                moov_data = NativeFastStart._flatten_video_stts(moov_data, on_log)
 
             # stco/co64 오프셋 보정
             try:
@@ -691,8 +744,11 @@ class NativeFastStart:
                         eta = (file_size - written) / bps if bps > 0 else 0
                         on_progress(pct, eta, bps / (1024 * 1024))  # MB/s 를 speed 슬롯에
 
+            out_size = os.path.getsize(output_path)
+            if out_size != file_size:
+                return False, f"출력 크기 불일치 (입력 {file_size:,} / 출력 {out_size:,} bytes)"
             on_progress(100.0, 0, 0)
-            elapsed = time.monotonic() - start
+            elapsed = max(0.001, time.monotonic() - start)
             on_log(f"  native: 완료 ({elapsed:.2f}s, 평균 {written/elapsed/1024/1024:.1f} MB/s)")
             return True, "OK"
 
@@ -831,6 +887,115 @@ class NativeFastStart:
             return True
         return False
 
+    # ── 비디오 stts 평탄화 (VFR → 의사 CFR, 박스 크기 변경 없음) ──
+    @staticmethod
+    def _find_video_trak(moov) -> Optional[Tuple[int, int, int]]:
+        pos, end = 8, len(moov)
+        while pos + 8 <= end:
+            try:
+                size = struct.unpack(">I", moov[pos:pos+4])[0]
+                atype = bytes(moov[pos+4:pos+8]).decode("ascii", errors="ignore")
+            except Exception:
+                return None
+            hs = 8
+            if size == 1:
+                if pos + 16 > end: return None
+                size = struct.unpack(">Q", moov[pos+8:pos+16])[0]
+                hs = 16
+            if size < 8 or pos + size > end:
+                return None
+            if atype == "trak":
+                mdia = NativeFastStart._find_box(moov, pos + hs, pos + size, "mdia")
+                if mdia:
+                    hdlr = NativeFastStart._find_box(moov, mdia[0] + mdia[2],
+                                                      mdia[0] + mdia[1], "hdlr")
+                    if hdlr:
+                        ht_pos = hdlr[0] + hdlr[2] + 4 + 4
+                        if ht_pos + 4 <= hdlr[0] + hdlr[1]:
+                            ht = bytes(moov[ht_pos:ht_pos+4]).decode("ascii", errors="ignore")
+                            if ht == "vide":
+                                return (pos, size, hs)
+            pos += size
+        return None
+
+    @staticmethod
+    def _flatten_video_stts(moov_bytes: bytes,
+                             on_log: Callable[[str], None]) -> bytes:
+        """비디오 stts 의 모든 sample_delta 를 평균값으로 일괄 변경 (VFR → 의사 CFR).
+           박스 크기 변동 없음. mdhd.duration 도 함께 보정."""
+        result = bytearray(moov_bytes)
+        video = NativeFastStart._find_video_trak(result)
+        if not video:
+            on_log("⚠ 비디오 trak 미발견 - stts 평탄화 스킵")
+            return moov_bytes
+        ts_start, ts_size, ts_hs = video
+
+        mdia = NativeFastStart._find_box(result, ts_start + ts_hs,
+                                          ts_start + ts_size, "mdia")
+        if not mdia: return moov_bytes
+        minf = NativeFastStart._find_box(result, mdia[0] + mdia[2],
+                                          mdia[0] + mdia[1], "minf")
+        if not minf: return moov_bytes
+        stbl = NativeFastStart._find_box(result, minf[0] + minf[2],
+                                          minf[0] + minf[1], "stbl")
+        if not stbl: return moov_bytes
+        stts = NativeFastStart._find_box(result, stbl[0] + stbl[2],
+                                          stbl[0] + stbl[1], "stts")
+        if not stts:
+            on_log("⚠ stts 미발견 - 평탄화 스킵")
+            return moov_bytes
+
+        cpos = stts[0] + stts[2] + 4
+        if cpos + 4 > stts[0] + stts[1]: return moov_bytes
+        count = struct.unpack(">I", result[cpos:cpos+4])[0]
+        if count == 0: return moov_bytes
+        espos = cpos + 4
+
+        total_samples = 0
+        total_duration = 0
+        deltas_seen = set()
+        for i in range(count):
+            ep = espos + i * 8
+            if ep + 8 > stts[0] + stts[1]: break
+            sc = struct.unpack(">I", result[ep:ep+4])[0]
+            sd = struct.unpack(">I", result[ep+4:ep+8])[0]
+            total_samples += sc
+            total_duration += sc * sd
+            deltas_seen.add(sd)
+        if total_samples == 0: return moov_bytes
+
+        if len(deltas_seen) == 1:
+            on_log(f"  stts 이미 균일 ({list(deltas_seen)[0]} ticks) - 평탄화 불필요")
+            return moov_bytes
+
+        new_delta = max(1, round(total_duration / total_samples))
+
+        for i in range(count):
+            ep = espos + i * 8
+            if ep + 8 > stts[0] + stts[1]: break
+            struct.pack_into(">I", result, ep + 4, new_delta)
+
+        new_total = total_samples * new_delta
+        drift = new_total - total_duration
+
+        # mdhd.duration 동기화
+        mdhd = NativeFastStart._find_box(result, mdia[0] + mdia[2],
+                                          mdia[0] + mdia[1], "mdhd")
+        if mdhd:
+            v = result[mdhd[0] + mdhd[2]]
+            if v == 1:
+                dur_pos = mdhd[0] + mdhd[2] + 4 + 8 + 8 + 4
+                if dur_pos + 8 <= mdhd[0] + mdhd[1]:
+                    struct.pack_into(">Q", result, dur_pos, new_total)
+            else:
+                dur_pos = mdhd[0] + mdhd[2] + 4 + 4 + 4 + 4
+                if dur_pos + 4 <= mdhd[0] + mdhd[1]:
+                    struct.pack_into(">I", result, dur_pos, new_total)
+
+        on_log(f"✓ 비디오 stts 평탄화: {len(deltas_seen)}종 → 단일 {new_delta} ticks "
+               f"(samples={total_samples:,}, drift={drift:+d} ticks)")
+        return bytes(result)
+
     @staticmethod
     def _apply_audio_offset(moov_bytes: bytes, offset_sec: float,
                              on_log: Callable[[str], None]) -> bytes:
@@ -888,14 +1053,14 @@ class NativeFastStart:
 
     @staticmethod
     def _copy(src: str, dst: str, size: int, ctrl,
-              on_progress: Callable[[float, float, float], None]):
-        """단순 복사 (이미 faststart 인 경우)"""
+              on_progress: Callable[[float, float, float], None]) -> bool:
+        """단순 복사 (이미 faststart 인 경우). 취소되면 False."""
         copied = 0
         start = time.monotonic()
         with open(src, "rb") as fin, open(dst, "wb") as fout:
             while True:
                 if ctrl.is_cancelled():
-                    return
+                    return False
                 ctrl.wait_if_paused(0.2)
                 buf = fin.read(NativeFastStart.CHUNK_SIZE)
                 if not buf:
@@ -907,6 +1072,415 @@ class NativeFastStart:
                 pct = max(0.0, min(99.5, copied / size * 100.0)) if size else 0
                 eta = (size - copied) / bps if bps > 0 else 0
                 on_progress(pct, eta, bps / (1024 * 1024))
+        return True
+
+
+# =====================================================================
+#  진단 도구 (MP4 timing 메타 분석)
+# =====================================================================
+class MP4Reader:
+    """진단용 헬퍼 (MP4Parser 와 별도 namespace)"""
+    @staticmethod
+    def iter_top_atoms(mm, end_pos: int):
+        pos = 0
+        while pos + 8 <= end_pos:
+            try:
+                size = struct.unpack(">I", mm[pos:pos+4])[0]
+                atype = bytes(mm[pos+4:pos+8]).decode("ascii", errors="ignore")
+            except Exception:
+                return
+            hs = 8
+            if size == 1:
+                if pos + 16 > end_pos: return
+                size = struct.unpack(">Q", mm[pos+8:pos+16])[0]
+                hs = 16
+            elif size == 0:
+                size = end_pos - pos
+            if size < 8 or pos + size > end_pos:
+                return
+            yield (pos, atype, size, hs)
+            pos += size
+
+    @staticmethod
+    def find_box(data, start: int, end: int, target: str,
+                 recurse_into: tuple = ()) -> Optional[Tuple[int, int, int]]:
+        pos = start
+        while pos + 8 <= end:
+            try:
+                size = struct.unpack(">I", data[pos:pos+4])[0]
+                atype = bytes(data[pos+4:pos+8]).decode("ascii", errors="ignore")
+            except Exception:
+                return None
+            hs = 8
+            if size == 1:
+                if pos + 16 > end: return None
+                size = struct.unpack(">Q", data[pos+8:pos+16])[0]
+                hs = 16
+            if size < 8 or pos + size > end:
+                return None
+            if atype == target:
+                return (pos, size, hs)
+            if atype in recurse_into:
+                found = MP4Reader.find_box(data, pos + hs, pos + size, target, recurse_into)
+                if found: return found
+            pos += size
+        return None
+
+
+class MP4Diagnostics:
+    """파일 stts/ctts/mvhd/mdhd/elst 등을 파싱해 VFR / B-프레임 / 싱크 진단"""
+
+    @staticmethod
+    def analyze(filepath: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            'filepath': filepath, 'size': 0, 'errors': [], 'top_atoms': [],
+            'is_faststart': False, 'is_fragmented': False,
+            'multi_mdat': False, 'multi_moov': False,
+            'mvhd': None, 'tracks': [],
+        }
+        try:
+            result['size'] = os.path.getsize(filepath)
+        except Exception as e:
+            result['errors'].append(f"파일 크기 확인 실패: {e}")
+            return result
+        try:
+            with open(filepath, "rb") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    MP4Diagnostics._analyze_mmap(mm, len(mm), result)
+        except Exception as e:
+            result['errors'].append(f"분석 실패: {e}")
+        return result
+
+    @staticmethod
+    def _analyze_mmap(mm, size, out):
+        moov_pos = -1; mdat_pos = -1
+        mdat_count = 0; moov_count = 0
+        for offset, atype, asize, hs in MP4Reader.iter_top_atoms(mm, size):
+            out['top_atoms'].append({'type': atype, 'offset': offset, 'size': asize})
+            if atype == 'moov':
+                moov_count += 1
+                if moov_pos == -1: moov_pos = offset
+            elif atype == 'mdat':
+                mdat_count += 1
+                if mdat_pos == -1: mdat_pos = offset
+            elif atype == 'moof':
+                out['is_fragmented'] = True
+        out['multi_mdat'] = mdat_count > 1
+        out['multi_moov'] = moov_count > 1
+        if moov_pos != -1 and mdat_pos != -1:
+            out['is_faststart'] = moov_pos < mdat_pos
+        elif moov_pos != -1 and mdat_pos == -1:
+            out['is_faststart'] = True
+        if moov_pos != -1:
+            moov_size = next(a['size'] for a in out['top_atoms'] if a['type'] == 'moov')
+            out['mvhd']   = MP4Diagnostics._parse_mvhd(mm, moov_pos, moov_size)
+            out['tracks'] = MP4Diagnostics._parse_tracks(mm, moov_pos, moov_size)
+
+    @staticmethod
+    def _parse_mvhd(mm, moov_offset, moov_size):
+        mvhd = MP4Reader.find_box(mm, moov_offset + 8, moov_offset + moov_size, "mvhd")
+        if not mvhd: return None
+        try:
+            v = mm[mvhd[0] + mvhd[2]]
+            if v == 1:
+                ts = mvhd[0] + mvhd[2] + 4 + 8 + 8
+                timescale = struct.unpack(">I", mm[ts:ts+4])[0]
+                duration  = struct.unpack(">Q", mm[ts+4:ts+12])[0]
+            else:
+                ts = mvhd[0] + mvhd[2] + 4 + 4 + 4
+                timescale = struct.unpack(">I", mm[ts:ts+4])[0]
+                duration  = struct.unpack(">I", mm[ts+4:ts+8])[0]
+            return {'timescale': timescale, 'duration': duration,
+                    'duration_sec': duration / timescale if timescale > 0 else 0}
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_tracks(mm, moov_offset, moov_size):
+        tracks = []
+        pos = moov_offset + 8
+        end = moov_offset + moov_size
+        while pos + 8 <= end:
+            try:
+                size = struct.unpack(">I", mm[pos:pos+4])[0]
+                atype = mm[pos+4:pos+8].decode("ascii", errors="ignore")
+            except Exception:
+                break
+            hs = 8
+            if size == 1:
+                size = struct.unpack(">Q", mm[pos+8:pos+16])[0]
+                hs = 16
+            if size < 8 or pos + size > end: break
+            if atype == "trak":
+                tracks.append(MP4Diagnostics._parse_trak(mm, pos, size, hs))
+            pos += size
+        return tracks
+
+    @staticmethod
+    def _parse_trak(mm, pos, size, hs):
+        trak_end = pos + size
+        info: Dict[str, Any] = {
+            'type': 'unknown', 'codec': '', 'timescale': 0, 'duration': 0,
+            'sample_count': 0, 'stts_entries': [], 'stts_total': 0,
+            'ctts_total': 0, 'has_b_frames': False,
+            'avg_fps': 0.0, 'avg_duration_ticks': 0.0,
+            'is_cfr': True, 'unique_durations': [], 'duration_distrib': {},
+            'elst_entries': [], 'width': 0, 'height': 0,
+        }
+        tkhd = MP4Reader.find_box(mm, pos + hs, trak_end, "tkhd")
+        if tkhd:
+            try:
+                wh_pos = tkhd[0] + tkhd[1] - 8
+                w = struct.unpack(">I", mm[wh_pos:wh_pos+4])[0]
+                h = struct.unpack(">I", mm[wh_pos+4:wh_pos+8])[0]
+                info['width']  = w >> 16
+                info['height'] = h >> 16
+            except Exception:
+                pass
+        mdia = MP4Reader.find_box(mm, pos + hs, trak_end, "mdia")
+        if not mdia: return info
+        mdhd = MP4Reader.find_box(mm, mdia[0] + mdia[2], mdia[0] + mdia[1], "mdhd")
+        if mdhd:
+            try:
+                v = mm[mdhd[0] + mdhd[2]]
+                if v == 1:
+                    ts = mdhd[0] + mdhd[2] + 4 + 8 + 8
+                    info['timescale'] = struct.unpack(">I", mm[ts:ts+4])[0]
+                    info['duration']  = struct.unpack(">Q", mm[ts+4:ts+12])[0]
+                else:
+                    ts = mdhd[0] + mdhd[2] + 4 + 4 + 4
+                    info['timescale'] = struct.unpack(">I", mm[ts:ts+4])[0]
+                    info['duration']  = struct.unpack(">I", mm[ts+4:ts+8])[0]
+            except Exception:
+                pass
+        hdlr = MP4Reader.find_box(mm, mdia[0] + mdia[2], mdia[0] + mdia[1], "hdlr")
+        if hdlr:
+            try:
+                ht = mm[hdlr[0] + hdlr[2] + 4 + 4: hdlr[0] + hdlr[2] + 4 + 8].decode("ascii", errors="ignore")
+                info['type'] = {'vide': 'video', 'soun': 'audio', 'subt': 'subtitle',
+                                'text': 'text', 'hint': 'hint'}.get(ht, ht)
+            except Exception:
+                pass
+        minf = MP4Reader.find_box(mm, mdia[0] + mdia[2], mdia[0] + mdia[1], "minf")
+        if not minf: return info
+        stbl = MP4Reader.find_box(mm, minf[0] + minf[2], minf[0] + minf[1], "stbl")
+        if not stbl: return info
+        stsd = MP4Reader.find_box(mm, stbl[0] + stbl[2], stbl[0] + stbl[1], "stsd")
+        if stsd:
+            try:
+                ep = stsd[0] + stsd[2] + 4 + 4
+                if ep + 8 <= stsd[0] + stsd[1]:
+                    info['codec'] = mm[ep+4:ep+8].decode("ascii", errors="ignore").strip("\0")
+            except Exception:
+                pass
+        stts = MP4Reader.find_box(mm, stbl[0] + stbl[2], stbl[0] + stbl[1], "stts")
+        if stts:
+            try:
+                cpos = stts[0] + stts[2] + 4
+                count = struct.unpack(">I", mm[cpos:cpos+4])[0]
+                info['stts_total'] = count
+                espos = cpos + 4
+                distrib = {}; total_samples = 0; total_duration = 0
+                for i in range(count):
+                    ep = espos + i * 8
+                    if ep + 8 > stts[0] + stts[1]: break
+                    sc = struct.unpack(">I", mm[ep:ep+4])[0]
+                    sd = struct.unpack(">I", mm[ep+4:ep+8])[0]
+                    if i < 50:
+                        info['stts_entries'].append((sc, sd))
+                    distrib[sd] = distrib.get(sd, 0) + sc
+                    total_samples  += sc
+                    total_duration += sc * sd
+                info['sample_count'] = total_samples
+                info['unique_durations'] = sorted(distrib.keys())
+                info['is_cfr'] = len(distrib) == 1
+                info['duration_distrib'] = distrib
+                if total_samples > 0 and info['timescale'] > 0:
+                    info['avg_duration_ticks'] = total_duration / total_samples
+                    info['avg_fps'] = info['timescale'] / info['avg_duration_ticks']
+            except Exception:
+                pass
+        ctts = MP4Reader.find_box(mm, stbl[0] + stbl[2], stbl[0] + stbl[1], "ctts")
+        if ctts:
+            try:
+                cpos = ctts[0] + ctts[2] + 4
+                count = struct.unpack(">I", mm[cpos:cpos+4])[0]
+                info['ctts_total'] = count
+                info['has_b_frames'] = count > 0
+            except Exception:
+                pass
+        edts = MP4Reader.find_box(mm, pos + hs, trak_end, "edts")
+        if edts:
+            elst = MP4Reader.find_box(mm, edts[0] + edts[2], edts[0] + edts[1], "elst")
+            if elst:
+                try:
+                    v = mm[elst[0] + elst[2]]
+                    cpos = elst[0] + elst[2] + 4
+                    cnt = struct.unpack(">I", mm[cpos:cpos+4])[0]
+                    ep = cpos + 4
+                    for i in range(min(cnt, 10)):
+                        if v == 1:
+                            if ep + 20 > elst[0] + elst[1]: break
+                            sd = struct.unpack(">Q", mm[ep:ep+8])[0]
+                            mt = struct.unpack(">q", mm[ep+8:ep+16])[0]
+                            ep += 20
+                        else:
+                            if ep + 12 > elst[0] + elst[1]: break
+                            sd = struct.unpack(">I", mm[ep:ep+4])[0]
+                            mt = struct.unpack(">i", mm[ep+4:ep+8])[0]
+                            ep += 12
+                        info['elst_entries'].append((sd, mt))
+                except Exception:
+                    pass
+        return info
+
+    @staticmethod
+    def format_report(r: Dict[str, Any]) -> str:
+        L = []
+        L.append("=" * 76)
+        L.append(f"  진단: {os.path.basename(r['filepath'])}")
+        L.append("=" * 76)
+        if r['errors']:
+            L.append("\n[오류]")
+            for e in r['errors']: L.append(f"  ✗ {e}")
+            return "\n".join(L)
+        L.append("")
+        L.append("[기본 정보]")
+        L.append(f"  • 파일 크기   : {r['size']:,} bytes ({r['size']/1024/1024:.2f} MB)")
+        L.append(f"  • Top atoms   : {len(r['top_atoms'])}개 ({', '.join(a['type'] for a in r['top_atoms'][:8])}{'...' if len(r['top_atoms']) > 8 else ''})")
+        L.append(f"  • FastStart   : {'✓ 적용됨' if r['is_faststart'] else '✗ 미적용'}")
+        if r['is_fragmented']: L.append(f"  • Fragmented  : ⚠ moof 감지 (NativeFastStart 거부)")
+        if r['multi_mdat']:    L.append(f"  • multi-mdat  : ⚠ 다중 mdat (NativeFastStart 거부)")
+        if r['multi_moov']:    L.append(f"  • multi-moov  : ⚠ 다중 moov (NativeFastStart 거부)")
+        if r['mvhd']:
+            m = r['mvhd']
+            L.append("")
+            L.append("[Movie Header (mvhd)]")
+            L.append(f"  • 영화 timescale : {m['timescale']} Hz")
+            L.append(f"  • 영화 duration  : {m['duration']} ticks ({m['duration_sec']:.3f} 초)")
+        for i, t in enumerate(r['tracks']):
+            L.append("")
+            head = f"[Track #{i+1}: {t['type']}"
+            if t['codec']: head += f" / {t['codec']}"
+            if t['type'] == 'video' and t['width'] and t['height']:
+                head += f" / {t['width']}x{t['height']}"
+            L.append(head + "]")
+            if t['timescale']:
+                dur_s = t['duration'] / t['timescale'] if t['timescale'] > 0 else 0
+                L.append(f"  • 미디어 timescale : {t['timescale']} Hz")
+                L.append(f"  • 미디어 duration  : {t['duration']} ticks ({dur_s:.3f} 초)")
+            L.append(f"  • 샘플 수          : {t['sample_count']:,}")
+            L.append(f"  • stts 엔트리 수   : {t['stts_total']}")
+            if t['type'] == 'video':
+                if t['avg_fps']:
+                    L.append(f"  • 평균 FPS         : {t['avg_fps']:.4f} (avg duration {t['avg_duration_ticks']:.1f} ticks)")
+                if t['is_cfr']:
+                    dur = t['unique_durations'][0] if t['unique_durations'] else 0
+                    fps = t['timescale'] / dur if dur > 0 and t['timescale'] else 0
+                    L.append(f"  • 프레임 일관성    : ✓ CFR (모든 프레임 {dur} ticks / {fps:.4f} fps)")
+                else:
+                    L.append(f"  • 프레임 일관성    : ⚠ VFR 감지 (고유 duration {len(t['unique_durations'])}종)")
+                    items = sorted(t['duration_distrib'].items(), key=lambda x: -x[1])
+                    total = sum(t['duration_distrib'].values())
+                    L.append(f"    └ 상위 분포 (max 5):")
+                    for dur, cnt in items[:5]:
+                        pct = cnt / total * 100 if total else 0
+                        ms  = dur / t['timescale'] * 1000 if t['timescale'] else 0
+                        fps = t['timescale'] / dur if dur > 0 and t['timescale'] else 0
+                        L.append(f"       {dur:>8} ticks  ={ms:>8.3f} ms / {fps:>8.3f} fps   {cnt:>8,}개 ({pct:5.2f}%)")
+                if t['has_b_frames']:
+                    L.append(f"  • B-프레임         : ✓ 존재 (ctts entries: {t['ctts_total']:,})")
+                else:
+                    L.append(f"  • B-프레임         : ✗ 없음")
+            elif t['type'] == 'audio':
+                if t['avg_duration_ticks']:
+                    sps = t['timescale'] / t['avg_duration_ticks'] if t['avg_duration_ticks'] else 0
+                    L.append(f"  • 평균 sample/sec  : {sps:.2f}")
+                if len(t['unique_durations']) == 1:
+                    L.append(f"  • 샘플 일관성      : ✓ 균일 ({t['unique_durations'][0]} ticks)")
+                else:
+                    L.append(f"  • 샘플 일관성      : ⚠ duration 종류 {len(t['unique_durations'])}종")
+            if t['elst_entries']:
+                L.append(f"  • Edit List (elst) : {len(t['elst_entries'])}개 entry")
+                for j, (sd, mt) in enumerate(t['elst_entries']):
+                    if mt == -1:
+                        L.append(f"    [{j}] segment_dur={sd}, media_time=-1 (empty edit / 빈 구간)")
+                    else:
+                        sec = mt / t['timescale'] if t['timescale'] else 0
+                        L.append(f"    [{j}] segment_dur={sd}, media_time={mt} ({sec:+.4f}초)")
+        L.append("")
+        L.append("[종합 진단]")
+        warnings = []
+        for t in r['tracks']:
+            if t['type'] == 'video' and not t['is_cfr'] and t['stts_total'] > 0:
+                warnings.append(
+                    "⚠ 비디오 트랙이 VFR (가변 프레임 레이트) 입니다.\n"
+                    "    → frame duration 이 일정하지 않아 미세한 jitter / 떨림으로 인지될 수 있습니다.\n"
+                    "    → NativeFastStart 는 원본 stts 를 그대로 보존하므로 이 특성이 출력에도 유지됩니다.\n"
+                    "    → 매끄럽게 만들려면 비디오 재인코딩 (PotEncoder / FFmpeg trans-code) 이 필요합니다."
+                )
+            if t['type'] == 'audio' and len(t['unique_durations']) > 1:
+                warnings.append("ℹ 오디오 sample duration 이 변동합니다 (드물게 보임). 일반적으로 재생에 영향 없음.")
+            if t['elst_entries']:
+                first = t['elst_entries'][0]
+                if first[1] not in (0, -1):
+                    sec = first[1] / t['timescale'] if t['timescale'] else 0
+                    warnings.append(
+                        f"ℹ {t['type']} 트랙에 media_time={first[1]} ({sec:+.3f}초) 의 elst 가 존재.\n"
+                        f"    → 이 트랙은 시작 시 {sec:+.3f}초 offset 으로 재생됨 (의도된 싱크 보정일 수 있음)."
+                    )
+        if r['is_fragmented']: warnings.append("⚠ Fragmented MP4 - NativeFastStart 거부.")
+        if r['multi_mdat']:    warnings.append("⚠ multi-mdat - NativeFastStart 거부.")
+        if r['multi_moov']:    warnings.append("⚠ multi-moov - NativeFastStart 거부.")
+        if not warnings:
+            L.append("  ✓ 특이사항 없음. NativeFastStart 결과는 원본과 byte-perfect 한 timing 을 유지합니다.")
+        else:
+            for w in warnings: L.append(f"  {w}")
+        L.append("")
+        L.append("=" * 76)
+        return "\n".join(L)
+
+
+class DiagnosticDialog(QDialog):
+    def __init__(self, filepath: str, parent=None):
+        super().__init__(parent)
+        self.filepath = filepath
+        self.setWindowTitle(f"파일 진단 - {os.path.basename(filepath)}")
+        self.resize(900, 650)
+        layout = QVBoxLayout(self)
+        result = MP4Diagnostics.analyze(filepath)
+        report = MP4Diagnostics.format_report(result)
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        f = QFont("Consolas", 9)
+        f.setStyleHint(QFont.TypeWriter)
+        self.text.setFont(f)
+        self.text.setPlainText(report)
+        self.text.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(self.text)
+        btns = QHBoxLayout()
+        btn_copy = QPushButton("📋 클립보드 복사")
+        btn_copy.clicked.connect(self._copy)
+        btn_save = QPushButton("💾 텍스트로 저장")
+        btn_save.clicked.connect(self._save)
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(self.reject)
+        btns.addWidget(btn_copy); btns.addWidget(btn_save); btns.addStretch(); btns.addWidget(btn_close)
+        layout.addLayout(btns)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self.text.toPlainText())
+
+    def _save(self):
+        default = os.path.splitext(self.filepath)[0] + "_diagnostic.txt"
+        path, _ = QFileDialog.getSaveFileName(self, "진단 결과 저장", default,
+                                                "Text Files (*.txt);;All Files (*)")
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self.text.toPlainText())
+            except Exception as e:
+                QMessageBox.warning(self, "저장 실패", str(e))
 
 
 # =====================================================================
@@ -1070,9 +1644,13 @@ class ProcessController(QObject):
 #  엔진 래퍼 (FFmpeg / MP4Box) - 실시간 진행률
 # =====================================================================
 class EngineRunner:
-    """단일 파일 처리. 실시간 진행률 콜백 / pause·cancel 지원."""
+    """단일 파일 처리. 실시간 진행률 콜백 / pause·cancel / 타임아웃 지원."""
 
     PROGRESS_RE_FFMPEG = re.compile(r"^([a-zA-Z_]+)=(.+)$")
+    # MP4Box 진행률: "45%" 또는 "(45/100)" 두 형식 모두 지원
+    PROGRESS_RE_MP4BOX = re.compile(r"(\d+(?:\.\d+)?)\s*%|\((\d+)/(\d+)\)")
+
+    HW_ENCODERS = {"nvidia": "h264_nvenc", "amd": "h264_amf", "intel": "h264_qsv"}
 
     def __init__(self, controller: ProcessController, ffmpeg_path: str,
                  mp4box_path: str, ffprobe_path: str, timeout: int):
@@ -1088,26 +1666,25 @@ class EngineRunner:
                    on_progress: Callable[[float, float, float], None],
                    on_log: Callable[[str], None]) -> Tuple[bool, str]:
         """faststart 처리. on_progress(percent, eta_sec, speed)"""
-        # 입력단: PTS 정상화 + 음수 타임스탬프 방지 (싱크 보존)
+        # 입력단: PTS 정상화 (싱크 보존)
         cmd = [self.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                "-fflags", "+genpts",
                "-thread_queue_size", "1024", "-i", input_path]
         # 모든 스트림/메타 보존
         cmd += ["-map", "0", "-map_metadata", "0"]
 
-        if hw_accel == "nvidia":
-            # GPU 트랜스코드: 프레임 타이밍 그대로 통과 (싱크 드리프트 방지)
-            cmd += ["-c:v", "h264_nvenc", "-c:a", "copy", "-vsync", "passthrough"]
-        elif hw_accel == "amd":
-            cmd += ["-c:v", "h264_amf", "-c:a", "copy", "-vsync", "passthrough"]
-        elif hw_accel == "intel":
-            cmd += ["-c:v", "h264_qsv", "-c:a", "copy", "-vsync", "passthrough"]
+        encoder = self.HW_ENCODERS.get(hw_accel)
+        if encoder:
+            # GPU 트랜스코드: 비디오만 재인코딩, 오디오/자막/데이터 스트림은 그대로 복사.
+            # -vsync 는 최신 FFmpeg 에서 제거됨 → -fps_mode 사용 (프레임 타이밍 그대로 통과)
+            cmd += ["-c", "copy", "-c:v", encoder, "-fps_mode", "passthrough"]
         else:
             # 카피 모드: 원본 타임스탬프 그대로 복사
             cmd += ["-c", "copy", "-copyts"]
 
         cmd += ["-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
+                "-f", "mp4",
                 "-progress", "pipe:1", "-nostats",
                 output_path]
 
@@ -1116,6 +1693,7 @@ class EngineRunner:
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
                 bufsize=1, universal_newlines=True, encoding="utf-8",
                 errors="ignore", startupinfo=STARTUPINFO, creationflags=CREATE_FLAGS,
             )
@@ -1124,16 +1702,8 @@ class EngineRunner:
         except Exception as e:
             return False, f"FFmpeg 실행 실패: {e}"
 
-        # psutil 등록
-        try:
-            ps_proc = psutil.Process(proc.pid)
-            self.ctrl.register(ps_proc)
-        except Exception:
-            ps_proc = None
+        ps_proc = self._register(proc)
 
-        start = time.monotonic()
-        last_percent = 0.0
-        speed = 0.0
         # stderr 스레드 (에러 수집)
         err_lines: List[str] = []
         def drain_stderr():
@@ -1149,55 +1719,51 @@ class EngineRunner:
         et = threading.Thread(target=drain_stderr, daemon=True)
         et.start()
 
+        lines = self._start_line_reader(proc.stdout)
+        clock = _ActiveClock()
+        last_percent = 0.0
+        speed = 0.0
+
         try:
             while True:
                 if self.ctrl.is_cancelled():
                     self._terminate(proc)
                     return False, "취소됨"
-                self.ctrl.wait_if_paused(0.2)
+                clock.pause_while(self.ctrl)
 
-                # progress pipe:1 한 줄 읽기
-                line = self._readline_with_timeout(proc.stdout, 0.5)
-                if line is None:
-                    if proc.poll() is not None:
-                        break
-                    if self.timeout and (time.monotonic() - start) > self.timeout:
+                try:
+                    line = lines.get(timeout=0.5)
+                except queue.Empty:
+                    # 출력이 없더라도 타임아웃은 반드시 검사 (FFmpeg 행(hang) 대비)
+                    if self.timeout and clock.elapsed() > self.timeout:
                         self._terminate(proc)
                         return False, "타임아웃"
                     continue
-                line = line.strip()
-                if not line:
-                    continue
-                m = self.PROGRESS_RE_FFMPEG.match(line)
+                if line is None:      # stdout EOF = 프로세스 종료
+                    break
+                m = self.PROGRESS_RE_FFMPEG.match(line.strip())
                 if not m:
                     continue
                 k, v = m.group(1), m.group(2)
                 if k == "out_time_us":
                     try:
                         cur = int(v) / 1_000_000.0
-                        if duration > 0:
-                            pct = max(0.0, min(99.5, cur / duration * 100.0))
-                            elapsed = max(0.001, time.monotonic() - start)
-                            speed = cur / elapsed
-                            eta = (duration - cur) / speed if speed > 0 else 0
-                            if pct - last_percent >= 0.5 or pct >= 99:
-                                on_progress(pct, eta, speed)
-                                last_percent = pct
-                    except Exception:
-                        pass
-                elif k == "speed":
-                    try:
-                        speed_str = v.strip().rstrip("x")
-                        if speed_str and speed_str != "N/A":
-                            float(speed_str)  # validate
-                    except Exception:
-                        pass
-                elif k == "progress" and v == "end":
+                    except ValueError:
+                        continue      # "N/A" 등
+                    if duration > 0 and cur >= 0:
+                        pct = max(0.0, min(99.5, cur / duration * 100.0))
+                        elapsed = max(0.001, clock.elapsed())
+                        speed = cur / elapsed
+                        eta = (duration - cur) / speed if speed > 0 else 0
+                        if pct - last_percent >= 0.5 or pct >= 99:
+                            on_progress(pct, eta, speed)
+                            last_percent = pct
+                elif k == "progress" and v.strip() == "end":
                     break
 
             # 종료 대기
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 self._terminate(proc)
                 return False, "프로세스 종료 대기 초과"
@@ -1214,8 +1780,6 @@ class EngineRunner:
                 self.ctrl.unregister(proc.pid)
 
     # --------------- MP4Box ---------------
-    PROGRESS_RE_MP4BOX = re.compile(r"(\d+(?:\.\d+)?)\s*%")
-
     def run_mp4box(self, input_path: str, output_path: str,
                    duration: float,
                    on_progress: Callable[[float, float, float], None],
@@ -1235,6 +1799,7 @@ class EngineRunner:
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
                 bufsize=1, universal_newlines=True, encoding="utf-8",
                 errors="ignore", startupinfo=STARTUPINFO, creationflags=CREATE_FLAGS,
             )
@@ -1243,50 +1808,56 @@ class EngineRunner:
         except Exception as e:
             return False, f"MP4Box 실행 실패: {e}"
 
-        try:
-            ps_proc = psutil.Process(proc.pid)
-            self.ctrl.register(ps_proc)
-        except Exception:
-            ps_proc = None
-
-        start = time.monotonic()
+        ps_proc = self._register(proc)
+        lines = self._start_line_reader(proc.stdout)
+        clock = _ActiveClock()
         out_buf: List[str] = []
         last_pct = 0.0
+        last_logged = ""
 
         try:
             while True:
                 if self.ctrl.is_cancelled():
                     self._terminate(proc)
                     return False, "취소됨"
-                self.ctrl.wait_if_paused(0.2)
+                clock.pause_while(self.ctrl)
 
-                line = self._readline_with_timeout(proc.stdout, 0.5)
-                if line is None:
-                    if proc.poll() is not None:
-                        break
-                    if self.timeout and (time.monotonic() - start) > self.timeout:
+                try:
+                    line = lines.get(timeout=0.5)
+                except queue.Empty:
+                    if self.timeout and clock.elapsed() > self.timeout:
                         self._terminate(proc)
                         return False, "타임아웃"
                     continue
+                if line is None:
+                    break
                 stripped = line.strip()
-                if stripped:
-                    out_buf.append(stripped)
-                    on_log(f"  mp4box: {stripped}")
+                if not stripped:
+                    continue
                 m = self.PROGRESS_RE_MP4BOX.search(stripped)
                 if m:
                     try:
-                        pct = float(m.group(1))
-                        if pct > last_pct:
-                            elapsed = max(0.001, time.monotonic() - start)
-                            speed = pct / elapsed if elapsed > 0 else 0
-                            eta = (100 - pct) / speed if speed > 0 else 0
-                            on_progress(min(pct, 99.5), eta, speed)
-                            last_pct = pct
-                    except ValueError:
-                        pass
+                        if m.group(1) is not None:
+                            pct = float(m.group(1))
+                        else:
+                            total = float(m.group(3)) or 100.0
+                            pct = float(m.group(2)) / total * 100.0
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        pct = -1
+                    if pct > last_pct:
+                        elapsed = max(0.001, clock.elapsed())
+                        speed = pct / elapsed
+                        eta = (100 - pct) / speed if speed > 0 else 0
+                        on_progress(min(pct, 99.5), eta, 0)
+                        last_pct = pct
+                    continue          # 진행률 줄은 로그에 쌓지 않음 (스팸 방지)
+                out_buf.append(stripped)
+                if stripped != last_logged:
+                    on_log(f"  mp4box: {stripped}")
+                    last_logged = stripped
 
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 self._terminate(proc)
                 return False, "프로세스 종료 대기 초과"
@@ -1302,6 +1873,34 @@ class EngineRunner:
                 self.ctrl.unregister(proc.pid)
 
     # --------------- Helpers ---------------
+    def _register(self, proc: subprocess.Popen) -> Optional[psutil.Process]:
+        try:
+            ps_proc = psutil.Process(proc.pid)
+            self.ctrl.register(ps_proc)
+            return ps_proc
+        except Exception:
+            return None
+
+    @staticmethod
+    def _start_line_reader(stream) -> "queue.Queue[Optional[str]]":
+        """별도 스레드에서 줄 단위로 읽어 큐에 넣는다. EOF 시 None.
+        (Windows 는 파이프 select 가 안 되어 readline 이 블로킹 → 기존 방식은
+         FFmpeg 가 멈추면 타임아웃 검사가 영영 실행되지 않던 문제 수정)"""
+        q: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def _pump():
+            try:
+                if stream is not None:
+                    for line in iter(stream.readline, ""):
+                        q.put(line)
+            except Exception:
+                pass
+            finally:
+                q.put(None)
+
+        threading.Thread(target=_pump, daemon=True).start()
+        return q
+
     @staticmethod
     def _shquote(s: str) -> str:
         if " " in s or "\t" in s:
@@ -1321,36 +1920,28 @@ class EngineRunner:
                 proc.kill()
             except Exception:
                 pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
-    @staticmethod
-    def _readline_with_timeout(stream, timeout: float) -> Optional[str]:
-        """non-blocking readline 흉내. 타임아웃 내 라인 없으면 None."""
-        if stream is None:
-            time.sleep(timeout)
-            return None
-        # 가장 안전한 방법: select on POSIX, polling on Windows
-        if sys.platform == "win32":
-            # Windows 는 파일핸들 select 가 안되므로 그냥 readline (블로킹)
-            # 단, 파이프 종료 시 readline 는 즉시 빈 문자열을 반환하여 빠져나옴
-            try:
-                line = stream.readline()
-                if line == "":
-                    return None
-                return line
-            except Exception:
-                return None
-        else:
-            import select
-            try:
-                r, _, _ = select.select([stream], [], [], timeout)
-                if not r:
-                    return None
-                line = stream.readline()
-                if line == "":
-                    return None
-                return line
-            except Exception:
-                return None
+
+class _ActiveClock:
+    """일시정지 시간을 뺀 '실제 처리 시간' 측정 (속도/ETA/타임아웃 계산용)."""
+
+    def __init__(self):
+        self._start = time.monotonic()
+        self._paused_total = 0.0
+
+    def pause_while(self, ctrl) -> None:
+        t = time.monotonic()
+        ctrl.wait_if_paused(0.2)
+        waited = time.monotonic() - t
+        if waited > 0.05:
+            self._paused_total += waited
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start - self._paused_total
 
 
 # =====================================================================
@@ -1363,13 +1954,55 @@ class WorkerSignals(QObject):
     finished = pyqtSignal(str, bool, str)   # (path, success, msg)
 
 
+TEMP_PREFIX = ".mp4hb_"
+TEMP_SUFFIX = ".tmp.mp4"
+
+
+def is_temp_artifact(name: str) -> bool:
+    """처리 중 생성되는 임시 파일인지 (폴더 스캔 시 목록에서 제외)"""
+    base = os.path.basename(name)
+    return base.startswith(".") and base.lower().endswith(TEMP_SUFFIX)
+
+
+def make_temp_path(final_out: str, fallback_dir: str) -> str:
+    """최종 출력과 같은 폴더에 임시 파일 생성 → os.replace 가 같은 볼륨에서 원자적으로 동작.
+    폴더에 쓸 수 없으면 앱 임시 폴더로 대체."""
+    name = f"{TEMP_PREFIX}{uuid.uuid4().hex}{TEMP_SUFFIX}"
+    target_dir = os.path.dirname(os.path.abspath(final_out))
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        if os.access(target_dir, os.W_OK):
+            return os.path.join(target_dir, name)
+    except Exception:
+        pass
+    os.makedirs(fallback_dir, exist_ok=True)
+    return os.path.join(fallback_dir, name)
+
+
+def move_into_place(src: str, dst: str) -> None:
+    """임시 파일을 최종 위치로 교체 (같은 볼륨이면 원자적, 아니면 복사 후 삭제)"""
+    try:
+        os.replace(src, dst)
+    except OSError:
+        shutil.move(src, dst)
+
+
+def restore_times(path: str, st: Optional[os.stat_result]) -> None:
+    if st is None:
+        return
+    try:
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    except Exception:
+        pass
+
+
 class FileProcessor(QRunnable):
     """단일 MP4 파일을 처리. 직렬 모드는 thread pool size=1 로 사용."""
 
     def __init__(self, filepath: str, engine: str, hw_accel: str,
                  cfg: AppConfig, ctrl: ProcessController,
                  ffmpeg: str, mp4box: str, ffprobe: str,
-                 temp_dir: str):
+                 temp_dir: str, output_path: Optional[str] = None):
         super().__init__()
         self.setAutoDelete(True)
         self.filepath  = filepath
@@ -1381,67 +2014,84 @@ class FileProcessor(QRunnable):
         self.mp4box    = mp4box
         self.ffprobe   = ffprobe
         self.temp_dir  = temp_dir
+        self.output_path = output_path   # 메인창에서 미리 계산한 출력 경로 (이름 충돌 해소 포함)
         self.signals   = WorkerSignals()
 
     # ------ 출력 경로 결정 ------
-    def _resolve_output_path(self) -> str:
-        mode = self.cfg.output_mode
-        src = Path(self.filepath)
-        if mode == OutputMode.SEPARATE_DIR.value and self.cfg.output_dir:
-            outdir = Path(self.cfg.output_dir)
-            outdir.mkdir(parents=True, exist_ok=True)
-            return str(outdir / src.name)
+    @staticmethod
+    def resolve_output_path(filepath: str, cfg: AppConfig) -> str:
+        mode = cfg.output_mode
+        src = Path(filepath)
+        if mode == OutputMode.SEPARATE_DIR.value and cfg.output_dir:
+            return str(Path(cfg.output_dir) / src.name)
         if mode == OutputMode.SUFFIX.value:
-            suf = self.cfg.output_suffix or "_hinted"
+            suf = cfg.output_suffix or "_hinted"
             return str(src.with_name(src.stem + suf + src.suffix))
         # OVERWRITE
-        return self.filepath
+        return filepath
+
+    def _fail(self, path: str, msg: str):
+        self.signals.state.emit(path, TaskState.FAILED.value)
+        self.signals.finished.emit(path, False, msg)
 
     def run(self):
         path = self.filepath
+        temp_out = ""
         try:
             if self.ctrl.is_cancelled():
                 self.signals.state.emit(path, TaskState.CANCELLED.value)
                 self.signals.finished.emit(path, False, "취소됨")
                 return
+            if not os.path.isfile(path):
+                self._fail(path, "원본 파일을 찾을 수 없음 (이동/삭제됨)")
+                return
 
             self.signals.state.emit(path, TaskState.CHECKING.value)
             info = MediaProbe.get_info(path, self.ffprobe)
+            try:
+                src_stat = os.stat(path)
+            except OSError:
+                src_stat = None
+            keep_times = src_stat if self.cfg.preserve_mtime else None
+
+            final_out = self.output_path or self.resolve_output_path(path, self.cfg)
+            in_place = os.path.normcase(os.path.abspath(final_out)) == \
+                       os.path.normcase(os.path.abspath(path))
 
             # 이미 처리됨 검사
-            if (self.engine == Engine.FFMPEG.value and info.has_faststart) or \
-               (self.engine == Engine.MP4BOX.value and info.has_hint_track):
+            already = (self.engine == Engine.FFMPEG.value and info.has_faststart) or \
+                      (self.engine == Engine.MP4BOX.value and info.has_hint_track)
+            if already:
+                if not in_place:
+                    # 별도 폴더 / 접미사 모드: 결과물이 빠지지 않도록 그대로 복사
+                    os.makedirs(os.path.dirname(os.path.abspath(final_out)), exist_ok=True)
+                    shutil.copy2(path, final_out)
+                    self.signals.progress.emit(path, 100.0, 0, 0)
+                    self.signals.state.emit(path, TaskState.SKIPPED.value)
+                    self.signals.finished.emit(path, True, "이미 처리됨 (출력 위치로 복사)")
+                    return
                 self.signals.state.emit(path, TaskState.SKIPPED.value)
                 self.signals.progress.emit(path, 100.0, 0, 0)
                 self.signals.finished.emit(path, True, "이미 처리됨")
                 return
 
-            # 디스크 여유 확인 (원본 크기의 1.2배)
+            temp_out = make_temp_path(final_out, self.temp_dir)
+
+            # 디스크 여유 확인 - 실제로 임시 파일이 만들어지는 드라이브 기준 (원본 크기의 1.2배)
             need = max(int(info.size * 1.2), 64 * 1024 * 1024)
             try:
-                free = shutil.disk_usage(self.temp_dir).free
+                free = shutil.disk_usage(os.path.dirname(temp_out)).free
                 if free < need:
-                    self.signals.finished.emit(path, False,
-                        f"디스크 여유 공간 부족 (필요 {need//1024//1024}MB / 가용 {free//1024//1024}MB)")
-                    self.signals.state.emit(path, TaskState.FAILED.value)
+                    self._fail(path, f"디스크 여유 공간 부족 (필요 {need//1024//1024}MB / "
+                                     f"가용 {free//1024//1024}MB)")
                     return
             except Exception:
                 pass
 
             self.signals.state.emit(path, TaskState.PROCESSING.value)
 
-            # 임시 출력 (덮어쓰기 모드일 때 사용; 직접 출력은 직접 경로)
-            final_out = self._resolve_output_path()
-            if final_out == path:  # overwrite
-                temp_out = os.path.join(self.temp_dir, f"{uuid.uuid4().hex}.mp4")
-            else:
-                # 별도 폴더 / 접미사 - 일단 옆 임시 파일에 만들고 atomic rename
-                tmpdir = os.path.dirname(final_out) or self.temp_dir
-                os.makedirs(tmpdir, exist_ok=True)
-                temp_out = os.path.join(tmpdir, f".{uuid.uuid4().hex}.tmp.mp4")
-
             backup_path = None
-            if self.cfg.backup_enabled and final_out == path:
+            if self.cfg.backup_enabled and in_place:
                 backup_dir = os.path.join(user_data_dir(), "backups")
                 os.makedirs(backup_dir, exist_ok=True)
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1472,37 +2122,35 @@ class FileProcessor(QRunnable):
 
             ok = False
             msg = ""
+            verified = False
             try:
                 if use_native:
                     on_log("⚡ Native FastStart 모드 (FFmpeg 우회)")
                     ok, msg = NativeFastStart.process(
                         path, temp_out, self.ctrl,
                         on_progress, on_log,
-                        audio_sync_offset_sec=self.cfg.audio_sync_offset_sec)
+                        audio_sync_offset_sec=self.cfg.audio_sync_offset_sec,
+                        flatten_video_stts=self.cfg.flatten_video_stts)
                     # native 가 성공해도 출력 검증 한 번 더 (불완전 파일 폴백용)
                     if ok and self.cfg.verify_output and os.path.isfile(temp_out):
-                        if not MediaProbe.verify_output(temp_out, self.ffprobe,
-                                                        info.duration):
-                            on_log("  native 출력 검증 실패 → FFmpeg 폴백 예정")
+                        if MediaProbe.verify_output(temp_out, self.ffprobe,
+                                                    info.duration):
+                            verified = True
+                        else:
                             ok = False
                             msg = "native 출력 검증 실패"
                     # native 가 처리할 수 없는 케이스 → FFmpeg 폴백
                     if not ok and not self.ctrl.is_cancelled():
                         on_log(f"  native 실패({msg}) → FFmpeg 폴백")
-                        try:
-                            if os.path.isfile(temp_out):
-                                os.remove(temp_out)
-                        except Exception:
-                            pass
+                        self._cleanup(temp_out)
                         ok, msg = runner.run_ffmpeg(path, temp_out, info.duration,
                                                     self.hw_accel, on_progress, on_log)
+                elif self.engine == Engine.FFMPEG.value:
+                    ok, msg = runner.run_ffmpeg(path, temp_out, info.duration,
+                                                self.hw_accel, on_progress, on_log)
                 else:
-                    if self.engine == Engine.FFMPEG.value:
-                        ok, msg = runner.run_ffmpeg(path, temp_out, info.duration,
-                                                    self.hw_accel, on_progress, on_log)
-                    else:
-                        ok, msg = runner.run_mp4box(path, temp_out, info.duration,
-                                                    on_progress, on_log)
+                    ok, msg = runner.run_mp4box(path, temp_out, info.duration,
+                                                on_progress, on_log)
             except Exception as e:
                 ok, msg = False, f"엔진 실행 예외: {e}"
 
@@ -1514,53 +2162,41 @@ class FileProcessor(QRunnable):
 
             if not ok or not os.path.isfile(temp_out):
                 self._cleanup(temp_out)
-                self.signals.state.emit(path, TaskState.FAILED.value)
-                self.signals.finished.emit(path, False, msg or "처리 실패")
+                self._fail(path, msg or "처리 실패")
                 return
 
-            # 무결성 검증
-            if self.cfg.verify_output:
+            # 무결성 검증 (native 경로는 위에서 이미 검증했으므로 FFmpeg/MP4Box 결과만)
+            if self.cfg.verify_output and not verified:
                 if not MediaProbe.verify_output(temp_out, self.ffprobe, info.duration):
                     self._cleanup(temp_out)
-                    self.signals.state.emit(path, TaskState.FAILED.value)
-                    self.signals.finished.emit(path, False, "출력 무결성 검증 실패")
+                    self._fail(path, "출력 무결성 검증 실패")
                     return
 
             # atomic replace / move
             try:
-                if final_out == path:
-                    # 덮어쓰기 - os.replace 는 원자성 보장 (동일 볼륨)
-                    try:
-                        os.replace(temp_out, path)
-                    except OSError:
-                        # 다른 볼륨일 경우 fallback
-                        shutil.move(temp_out, path)
-                else:
-                    if os.path.exists(final_out):
-                        try: os.remove(final_out)
-                        except Exception: pass
-                    os.replace(temp_out, final_out) if os.path.dirname(temp_out) == os.path.dirname(final_out) \
-                        else shutil.move(temp_out, final_out)
+                move_into_place(temp_out, final_out)
             except Exception as e:
                 self._cleanup(temp_out)
-                # 백업 복원
+                # 백업 복원 (덮어쓰기 도중 실패해 원본이 손상된 경우 대비)
                 if backup_path and os.path.isfile(backup_path):
                     try:
                         shutil.copy2(backup_path, path)
                         self.signals.log.emit("백업에서 복원됨")
                     except Exception as ex:
                         self.signals.log.emit(f"백업 복원 실패: {ex}")
-                self.signals.state.emit(path, TaskState.FAILED.value)
-                self.signals.finished.emit(path, False, f"파일 교체 실패: {e}")
+                hint = " (다른 프로그램이 파일을 사용 중인지 확인하세요)" \
+                    if isinstance(e, PermissionError) else ""
+                self._fail(path, f"파일 교체 실패: {e}{hint}")
                 return
 
+            restore_times(final_out, keep_times)
             self.signals.progress.emit(path, 100.0, 0, 0)
             self.signals.state.emit(path, TaskState.DONE.value)
             self.signals.finished.emit(path, True, "OK")
         except Exception as e:
             logger.exception(f"FileProcessor 예외: {path}")
-            self.signals.state.emit(path, TaskState.FAILED.value)
-            self.signals.finished.emit(path, False, f"예외: {e}")
+            self._cleanup(temp_out)
+            self._fail(path, f"예외: {e}")
 
     @staticmethod
     def _cleanup(path: str):
@@ -1599,6 +2235,7 @@ class CheckWorker(QRunnable):
                     "vc": info.video_codec, "ac": info.audio_codec,
                     "w": info.width, "h": info.height,
                     "fs": info.has_faststart, "ht": info.has_hint_track,
+                    "br": info.bit_rate,
                 }
             }, ensure_ascii=False)
             self.signals.log.emit(f"__META__{payload}")
@@ -1727,6 +2364,118 @@ class DnDTreeWidget(QTreeWidget):
 
 
 # =====================================================================
+#  토스트 알림 (작업 완료 시 화면 우하단, 3초 후 자동으로 사라짐)
+# =====================================================================
+class ToastNotification(QWidget):
+    """Windows 토스트 스타일 알림.
+    - 작업표시줄 위 화면 우하단에 표시, 포커스를 빼앗지 않음
+    - duration_ms 후 페이드아웃되며 사라짐 (클릭하면 즉시 닫힘)
+    - 여러 개가 겹치면 위로 쌓임
+    """
+    _active: List["ToastNotification"] = []
+
+    ACCENT = {"success": "#2E7D32", "warning": "#C05800", "error": "#CD1C18"}
+    ICON   = {"success": "✓", "warning": "!", "error": "✕"}
+
+    def __init__(self, title: str, message: str, level: str = "success",
+                 duration_ms: int = 3000, on_click: Optional[Callable[[], None]] = None):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self._on_click = on_click
+        accent = self.ACCENT.get(level, self.ACCENT["success"])
+
+        frame = QFrame(self)
+        frame.setObjectName("toastFrame")
+        frame.setStyleSheet(f"""
+            QFrame#toastFrame {{ background:#2b2d31; border:1px solid #45484e;
+                                 border-left:4px solid {accent}; border-radius:8px; }}
+            QLabel {{ background:transparent; border:none; }}
+            QLabel#toastIcon {{ color:#ffffff; background:{accent}; border-radius:12px;
+                                font-weight:700; font-size:11pt; }}
+            QLabel#toastTitle {{ color:#ffffff; font-weight:700; font-size:10.5pt; }}
+            QLabel#toastBody  {{ color:#d5d8dc; font-size:9.5pt; }}
+            QLabel#toastApp   {{ color:#b4b8be; font-size:8.5pt; }}
+        """)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(frame)
+
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(14, 12, 18, 12)
+        row.setSpacing(12)
+        icon = QLabel(self.ICON.get(level, "✓"))
+        icon.setObjectName("toastIcon")
+        icon.setFixedSize(24, 24)
+        icon.setAlignment(Qt.AlignCenter)
+        row.addWidget(icon, 0, Qt.AlignTop)
+
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        app_lbl = QLabel(APP_NAME)
+        app_lbl.setObjectName("toastApp")
+        t = QLabel(title)
+        t.setObjectName("toastTitle")
+        b = QLabel(message)
+        b.setObjectName("toastBody")
+        b.setWordWrap(True)
+        col.addWidget(app_lbl)
+        col.addWidget(t)
+        col.addWidget(b)
+        row.addLayout(col, 1)
+
+        self.setFixedWidth(360)
+        self.adjustSize()
+
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(250)
+        self._fade.setStartValue(1.0)
+        self._fade.setEndValue(0.0)
+        self._fade.finished.connect(self.close)
+        # duration_ms 시점에 완전히 사라지도록 페이드 시작 시점을 앞당김
+        QTimer.singleShot(max(0, duration_ms - self._fade.duration()), self._fade.start)
+
+    @classmethod
+    def show_toast(cls, title: str, message: str, level: str = "success",
+                   duration_ms: int = 3000, on_click: Optional[Callable[[], None]] = None):
+        toast = cls(title, message, level, duration_ms, on_click)
+        screen = QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen else QRect(0, 0, 1280, 800)
+        margin = 16
+        y = area.bottom() - margin - toast.height()
+        for other in cls._active:
+            y = min(y, other.y() - 8 - toast.height())
+        toast.move(area.right() - margin - toast.width(), y)
+        cls._active.append(toast)
+        toast.show()
+        return toast
+
+    def mousePressEvent(self, e):
+        if self._on_click:
+            try:
+                self._on_click()
+            except Exception:
+                pass
+        self.close()
+
+    def closeEvent(self, e):
+        if self in ToastNotification._active:
+            ToastNotification._active.remove(self)
+        super().closeEvent(e)
+
+
+def vline() -> QFrame:
+    """버튼 그룹 구분선"""
+    f = QFrame()
+    f.setFrameShape(QFrame.VLine)
+    f.setFrameShadow(QFrame.Plain)
+    f.setStyleSheet("color:#4a4d52;")
+    f.setFixedHeight(24)
+    return f
+
+
+# =====================================================================
 #  설정 다이얼로그
 # =====================================================================
 class SettingsDialog(QDialog):
@@ -1793,6 +2542,11 @@ class SettingsDialog(QDialog):
         self.chk_backup.setChecked(cfg.backup_enabled)
         pl.addRow(self.chk_backup)
 
+        self.chk_mtime = QCheckBox("원본 파일의 수정 날짜 유지")
+        self.chk_mtime.setChecked(cfg.preserve_mtime)
+        self.chk_mtime.setToolTip("처리 후에도 탐색기의 '수정한 날짜'가 원본과 같게 유지됩니다.")
+        pl.addRow(self.chk_mtime)
+
         self.chk_hw = QCheckBox("하드웨어 가속 사용 (GPU 트랜스코드)")
         self.chk_hw.setChecked(cfg.hw_accel_enabled)
         pl.addRow(self.chk_hw)
@@ -1816,11 +2570,28 @@ class SettingsDialog(QDialog):
         self.sp_audio_offset.setSuffix("  초")
         self.sp_audio_offset.setValue(float(cfg.audio_sync_offset_sec))
         self.sp_audio_offset.setToolTip(
-            "Native FastStart 사용 시 오디오 elst(media_time) 를\n"
-            "지정한 초만큼 앞당겨 음성 싱크를 보정합니다.\n"
-            "(0.15초 = 오디오가 0.15초 더 빨리 재생)\n"
-            "0 으로 두면 보정 없음. FFmpeg/MP4Box 모드에서는 적용 안됨.")
+            "【권장: 0.000】\n\n"
+            "NativeFastStart 는 stts/ctts/elst/mvhd 등 모든 타이밍 메타를\n"
+            "그대로 보존하므로 일반적으로 보정이 필요 없습니다.\n\n"
+            "특정 파일에서만 일관된 싱크 드리프트가 보일 때\n"
+            "양수 값을 입력하면 audio elst.media_time 을\n"
+            "지정 초만큼 앞당겨 보정합니다. (FFmpeg/MP4Box 에는 미적용)\n\n"
+            "값을 잘못 설정하면 오히려 정상 파일의 싱크를 깨뜨릴 수 있으니\n"
+            "특별한 이유가 없다면 0 으로 두세요.")
         pl.addRow("오디오 싱크 보정:", self.sp_audio_offset)
+
+        self.chk_flatten = QCheckBox("비디오 stts 평탄화 (VFR → CFR, 떨림 제거)")
+        self.chk_flatten.setChecked(cfg.flatten_video_stts)
+        self.chk_flatten.setToolTip(
+            "비디오 stts 의 모든 sample_delta 를 평균값으로 일괄 변경하여\n"
+            "VFR (가변 프레임 듀레이션) 을 의사 CFR 로 만듭니다.\n\n"
+            "효과: 990↔1020 ticks 식으로 교대하는 미세 jitter 제거\n"
+            "방식: 박스 크기 변경 없이 in-place 수정 (재인코딩 X, 매우 빠름)\n"
+            "부작용: 총 duration 미세 변경 (~10ms 내외)\n\n"
+            "원본이 이미 CFR 이면 자동 스킵됩니다.\n"
+            "WEB-DL / 방송 녹화 등 NTSC 29.97 fps VFR 파일에 권장.\n"
+            "Native FastStart 사용 시에만 적용됩니다 (FFmpeg/MP4Box 모드 미적용).")
+        pl.addRow(self.chk_flatten)
 
         layout.addWidget(gb_proc)
 
@@ -1867,9 +2638,11 @@ class SettingsDialog(QDialog):
         cfg.timeout          = self.sp_timeout.value()
         cfg.verify_output    = self.chk_verify.isChecked()
         cfg.backup_enabled   = self.chk_backup.isChecked()
+        cfg.preserve_mtime   = self.chk_mtime.isChecked()
         cfg.hw_accel_enabled = self.chk_hw.isChecked()
         cfg.native_faststart = self.chk_native.isChecked()
         cfg.audio_sync_offset_sec = float(self.sp_audio_offset.value())
+        cfg.flatten_video_stts = self.chk_flatten.isChecked()
         cfg.theme            = "dark" if self.cb_theme.currentIndex() == 0 else "light"
 
 
@@ -1900,6 +2673,11 @@ class MainWindow(QMainWindow):
         self.controller = ProcessController()
         self.pool = QThreadPool()
         self._update_pool_size()
+        # 메타 정보 검사는 별도 풀 → 직렬 처리 중에도 목록 정보가 바로 채워짐
+        self.check_pool = QThreadPool()
+        self.check_pool.setMaxThreadCount(max(2, min(4, (os.cpu_count() or 2))))
+        # 경로 → 트리 항목 (진행률 시그널마다 전체 목록을 훑던 O(n) 탐색 제거)
+        self._items: Dict[str, QTreeWidgetItem] = {}
 
         # 진행 카운터
         self._mutex = QMutex()
@@ -1928,44 +2706,72 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(central)
         v.setContentsMargins(8, 8, 8, 4)
 
-        # ---- 상단 툴바 영역 ----
+        # ---- 상단 툴바: [목록 관리] ......... [처리 제어] | [실행] | [설정] ----
         top = QHBoxLayout()
+        top.setSpacing(6)
         self.btn_add      = QPushButton("📁 파일 추가")
-        self.btn_add_dir  = QPushButton("📂 폴더 추가 (재귀)")
-        self.btn_proc_sel = QPushButton("▶ 선택 처리")
-        self.btn_proc_all = QPushButton("⏵ 전체 처리")
+        self.btn_add_dir  = QPushButton("📂 폴더 추가")
+        self.btn_remove   = QPushButton("선택 제거")
+        self.btn_clear    = QPushButton("목록 비우기")
         self.btn_pause    = QPushButton("⏸ 일시정지")
         self.btn_cancel   = QPushButton("⏹ 취소")
-        self.btn_settings = QPushButton("⚙ 설정")
+        self.btn_proc_sel = QPushButton("▶ 선택 처리")
+        self.btn_proc_all = QPushButton("▶▶ 전체 처리")
+        self.btn_settings = QPushButton("⚙")
 
-        for b in (self.btn_add, self.btn_add_dir, self.btn_proc_sel, self.btn_proc_all,
-                  self.btn_pause, self.btn_cancel, self.btn_settings):
-            b.setMinimumHeight(32)
-            top.addWidget(b)
+        self.btn_proc_all.setObjectName("primary")
+        self.btn_cancel.setObjectName("danger")
+        self.btn_settings.setFixedWidth(40)
+
+        tips = {
+            self.btn_add:      "MP4 파일 추가 (Ctrl+O)",
+            self.btn_add_dir:  "폴더의 하위 MP4 모두 추가 (Ctrl+Shift+O)",
+            self.btn_remove:   "선택한 항목을 목록에서 제거 (Delete)",
+            self.btn_clear:    "목록 전체 비우기",
+            self.btn_pause:    "일시정지 / 재개 (Space)",
+            self.btn_cancel:   "진행 중인 작업 취소 (Esc)",
+            self.btn_proc_sel: "선택한 파일만 처리 (Ctrl+R)",
+            self.btn_proc_all: "목록의 모든 파일 처리 (F5)",
+            self.btn_settings: "환경설정 (Ctrl+,)",
+        }
+        for btn, tip in tips.items():
+            btn.setMinimumHeight(34)
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.PointingHandCursor)
+
+        for w in (self.btn_add, self.btn_add_dir, vline(), self.btn_remove, self.btn_clear):
+            top.addWidget(w)
+        top.addStretch(1)
+        for w in (self.btn_pause, self.btn_cancel, vline(),
+                  self.btn_proc_sel, self.btn_proc_all, vline(), self.btn_settings):
+            top.addWidget(w)
 
         self.btn_pause.setEnabled(False)
         self.btn_cancel.setEnabled(False)
 
         self.btn_add.clicked.connect(self._on_add_files)
         self.btn_add_dir.clicked.connect(self._on_add_dir)
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_clear.clicked.connect(self._clear_all)
         self.btn_proc_sel.clicked.connect(lambda: self._start_processing(selected_only=True))
         self.btn_proc_all.clicked.connect(lambda: self._start_processing(selected_only=False))
         self.btn_pause.clicked.connect(self._on_pause_resume)
         self.btn_cancel.clicked.connect(self._on_cancel)
         self.btn_settings.clicked.connect(self._on_settings)
-
-        top.addStretch()
         v.addLayout(top)
 
-        # ---- 옵션 행 ----
+        # ---- 옵션 행: 엔진 / 가속 / 방식 ......... 검색 ----
         opt = QHBoxLayout()
-        opt.addWidget(QLabel("엔진:"))
+        opt.setSpacing(6)
+        opt.addWidget(QLabel("엔진"))
         self.cb_engine = QComboBox()
         self.cb_engine.addItems(["FFmpeg (FastStart)", "MP4Box (Hint Track)"])
         self.cb_engine.setCurrentIndex(0 if self.cfg.engine == Engine.FFMPEG.value else 1)
         self.cb_engine.currentIndexChanged.connect(self._on_engine_changed)
         opt.addWidget(self.cb_engine)
 
+        opt.addSpacing(8)
+        opt.addWidget(QLabel("가속"))
         self.cb_hw = QComboBox()
         self.cb_hw.addItems(["CPU (Stream Copy)", "GPU 트랜스코드"])
         self.cb_hw.setCurrentIndex(1 if self.cfg.hw_accel_enabled else 0)
@@ -1973,25 +2779,21 @@ class MainWindow(QMainWindow):
         self.cb_hw.currentIndexChanged.connect(self._on_hw_changed)
         opt.addWidget(self.cb_hw)
 
+        opt.addSpacing(8)
+        opt.addWidget(QLabel("방식"))
         self.cb_mode = QComboBox()
         self.cb_mode.addItems(["직렬 처리", "병렬 처리"])
         self.cb_mode.setCurrentIndex(0 if self.cfg.process_mode == "serial" else 1)
         self.cb_mode.currentIndexChanged.connect(self._on_mode_changed)
-        opt.addWidget(QLabel("방식:"))
         opt.addWidget(self.cb_mode)
 
-        opt.addWidget(QLabel("필터:"))
+        opt.addStretch(1)
         self.le_filter = QLineEdit()
-        self.le_filter.setPlaceholderText("파일명 또는 상태로 검색...")
+        self.le_filter.setPlaceholderText("🔍 파일명 또는 상태로 검색...")
+        self.le_filter.setClearButtonEnabled(True)
+        self.le_filter.setMinimumWidth(260)
         self.le_filter.textChanged.connect(self._apply_filter)
-        opt.addWidget(self.le_filter, 1)
-
-        self.btn_remove = QPushButton("🗑 선택 제거")
-        self.btn_remove.clicked.connect(self._remove_selected)
-        self.btn_clear  = QPushButton("🗑 전체 제거")
-        self.btn_clear.clicked.connect(self._clear_all)
-        opt.addWidget(self.btn_remove)
-        opt.addWidget(self.btn_clear)
+        opt.addWidget(self.le_filter)
 
         v.addLayout(opt)
 
@@ -2002,8 +2804,9 @@ class MainWindow(QMainWindow):
 
         # ---- 파일 트리 ----
         self.tree = DnDTreeWidget()
-        self.tree.setColumnCount(6)
-        self.tree.setHeaderLabels(["파일명", "크기", "길이", "상태", "진행률", "경로"])
+        self.tree.setColumnCount(9)
+        self.tree.setHeaderLabels(
+            ["파일명", "해상도", "코덱", "비트레이트", "길이", "크기", "상태", "진행률", "경로"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setRootIsDecorated(False)
         self.tree.setUniformRowHeights(True)
@@ -2012,11 +2815,14 @@ class MainWindow(QMainWindow):
         self.tree.setItemDelegateForColumn(COL_PROGRESS, ProgressDelegate(self))
         h = self.tree.header()
         h.setSectionResizeMode(COL_NAME,     QHeaderView.Stretch)
-        h.setSectionResizeMode(COL_SIZE,     QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_RES,      QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_CODEC,    QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_BITRATE,  QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_DURATION, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_SIZE,     QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_STATUS,   QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_PROGRESS, QHeaderView.Fixed)
-        self.tree.setColumnWidth(COL_PROGRESS, 130)
+        self.tree.setColumnWidth(COL_PROGRESS, 80)   # 130 → 80
         self.tree.setColumnHidden(COL_PATH, True)
         self.tree.files_dropped.connect(self._on_paths_dropped)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
@@ -2083,6 +2889,11 @@ class MainWindow(QMainWindow):
         self.act_show_log.setShortcut("Ctrl+L")
         self.act_show_log.toggled.connect(self._on_toggle_log)
         m_view.addAction(self.act_show_log)
+
+        m_tool = mb.addMenu("&도구")
+        a_diag = QAction("📊 파일 진단...", self); a_diag.setShortcut("Ctrl+D")
+        a_diag.triggered.connect(self._on_diagnose)
+        m_tool.addAction(a_diag)
 
         m_set = mb.addMenu("&설정")
         a_set = QAction("환경설정...", self); a_set.setShortcut("Ctrl+,"); a_set.triggered.connect(self._on_settings)
@@ -2159,9 +2970,9 @@ class MainWindow(QMainWindow):
                     dirs_seen.append(p)
                     for root, _, fnames in os.walk(p):
                         for fn in fnames:
-                            if fn.lower().endswith(".mp4"):
+                            if fn.lower().endswith(".mp4") and not is_temp_artifact(fn):
                                 files.append(os.path.join(root, fn))
-                elif os.path.isfile(p) and p.lower().endswith(".mp4"):
+                elif os.path.isfile(p) and p.lower().endswith(".mp4") and not is_temp_artifact(p):
                     files.append(p)
             except Exception as e:
                 self._log(f"경로 스캔 오류 {p}: {e}")
@@ -2197,12 +3008,21 @@ class MainWindow(QMainWindow):
             existing.add(_norm(f))
             added += 1
             # 비동기 메타 체크
-            engine = self._current_engine()
-            cw = CheckWorker(f, engine, self.ffprobe_path)
-            cw.signals.state.connect(self._on_state_change)
-            cw.signals.log.connect(self._on_check_log)
-            self.pool.start(cw)
+            self._start_check(f, self._current_engine())
         self._log(f"파일 추가: {added}개 / 중복 제외: {dup}개")
+
+    def _start_check(self, path: str, engine: str):
+        cw = CheckWorker(path, engine, self.ffprobe_path)
+        cw.signals.state.connect(self._on_check_state)
+        cw.signals.log.connect(self._on_check_log)
+        self.check_pool.start(cw)
+
+    def _on_check_state(self, path: str, state: str):
+        """메타 검사 결과는 아직 '확인 중' 인 항목에만 반영
+        (처리가 먼저 끝난 항목의 '완료' 상태를 덮어쓰지 않도록)"""
+        it = self._find_item(path)
+        if it and it.text(COL_STATUS) == TaskState.CHECKING.value:
+            it.setText(COL_STATUS, state)
 
     def _existing_paths(self) -> List[str]:
         out = []
@@ -2215,19 +3035,24 @@ class MainWindow(QMainWindow):
         it = QTreeWidgetItem()
         it.setText(COL_NAME,     os.path.basename(filepath))
         it.setToolTip(COL_NAME,  filepath)
-        it.setText(COL_SIZE,     "...")
+        it.setText(COL_RES,      "...")
+        it.setText(COL_CODEC,    "...")
+        it.setText(COL_BITRATE,  "...")
         it.setText(COL_DURATION, "...")
+        it.setText(COL_SIZE,     "...")
         it.setText(COL_STATUS,   TaskState.CHECKING.value)
         it.setText(COL_PATH,     filepath)
         it.setData(COL_PROGRESS, ProgressDelegate.PROG_ROLE, 0)
         self.tree.addTopLevelItem(it)
+        self._items[filepath] = it
 
     def _find_item(self, filepath: str) -> Optional[QTreeWidgetItem]:
-        for i in range(self.tree.topLevelItemCount()):
-            it = self.tree.topLevelItem(i)
-            if it.text(COL_PATH) == filepath:
-                return it
-        return None
+        return self._items.get(filepath)
+
+    def _take_item(self, it: QTreeWidgetItem):
+        self._items.pop(it.text(COL_PATH), None)
+        self._meta.pop(it.text(COL_PATH), None)
+        self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(it))
 
     def _remove_selected(self):
         items = self.tree.selectedItems()
@@ -2236,8 +3061,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "알림", "처리 중에는 항목을 제거할 수 없습니다.")
             return
         for it in items:
-            idx = self.tree.indexOfTopLevelItem(it)
-            self.tree.takeTopLevelItem(idx)
+            self._take_item(it)
         self._log(f"{len(items)}개 항목 제거")
 
     def _clear_all(self):
@@ -2249,6 +3073,8 @@ class MainWindow(QMainWindow):
         n = self.tree.topLevelItemCount()
         if QMessageBox.question(self, "확인", f"전체 {n}개 항목을 제거할까요?") == QMessageBox.Yes:
             self.tree.clear()
+            self._items.clear()
+            self._meta.clear()
             self._log(f"{n}개 항목 전체 제거")
 
     # ---------------- 옵션 변경 ----------------
@@ -2266,10 +3092,7 @@ class MainWindow(QMainWindow):
             it = self.tree.topLevelItem(i)
             it.setText(COL_STATUS, TaskState.CHECKING.value)
             it.setData(COL_PROGRESS, ProgressDelegate.PROG_ROLE, 0)
-            cw = CheckWorker(it.text(COL_PATH), self.cfg.engine, self.ffprobe_path)
-            cw.signals.state.connect(self._on_state_change)
-            cw.signals.log.connect(self._on_check_log)
-            self.pool.start(cw)
+            self._start_check(it.text(COL_PATH), self.cfg.engine)
 
     def _on_hw_changed(self, idx: int):
         self.cfg.hw_accel_enabled = (idx == 1)
@@ -2360,18 +3183,43 @@ class MainWindow(QMainWindow):
         self._log(f"=== 처리 시작 (총 {self._total}개, 엔진={engine}, "
                   f"가속={hw}, 모드={self.cfg.process_mode}, 출력={self.cfg.output_mode}) ===")
 
+        outputs = self._plan_output_paths(paths)
+
         # 워커 큐잉
         for p in paths:
             it = self._find_item(p)
-            if it: it.setText(COL_STATUS, TaskState.QUEUED.value)
+            if it:
+                it.setText(COL_STATUS, TaskState.QUEUED.value)
+                it.setData(COL_PROGRESS, ProgressDelegate.PROG_ROLE, 0)
             w = FileProcessor(p, engine, hw, self.cfg, self.controller,
                               self.ffmpeg_path, self.mp4box_path, self.ffprobe_path,
-                              self.temp_dir)
+                              self.temp_dir, output_path=outputs.get(p))
             w.signals.state.connect(self._on_state_change)
             w.signals.progress.connect(self._on_progress)
             w.signals.log.connect(self._log)
             w.signals.finished.connect(self._on_file_finished)
             self.pool.start(w)
+
+    def _plan_output_paths(self, paths: List[str]) -> Dict[str, str]:
+        """출력 경로를 미리 정하고, 같은 이름이 겹치면 '_2', '_3' 을 붙인다.
+        (별도 폴더 출력 시 서로 다른 폴더의 같은 이름 파일이 서로 덮어쓰던 문제 수정)"""
+        result: Dict[str, str] = {}
+        used = set()
+        for p in paths:
+            base_out = FileProcessor.resolve_output_path(p, self.cfg)
+            out = base_out
+            same_as_src = os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(p))
+            if not same_as_src:
+                stem, ext = os.path.splitext(base_out)
+                n = 2
+                while os.path.normcase(os.path.abspath(out)) in used:
+                    out = f"{stem}_{n}{ext}"
+                    n += 1
+                if out != base_out:
+                    self._log(f"출력 이름 중복 → {os.path.basename(out)} 로 저장: {p}")
+            used.add(os.path.normcase(os.path.abspath(out)))
+            result[p] = out
+        return result
 
     def _on_pause_resume(self):
         if not self._processing_active:
@@ -2443,11 +3291,29 @@ class MainWindow(QMainWindow):
             summary = (f"처리 완료\n\n총 {total}개 / 성공 {success_n} / 실패 {fail_n}"
                        + ("\n(취소됨)" if cancelled else ""))
             self._log("=== " + summary.replace("\n\n", " - ").replace("\n", " ") + " ===")
-            if fail_n > 0 or cancelled:
-                QMessageBox.warning(self, "완료", summary)
-            else:
-                QMessageBox.information(self, "완료", summary)
+            self._notify_finished(total, success_n, fail_n, cancelled)
             self.lbl_progress.setText("준비됨")
+
+    def _notify_finished(self, total: int, success_n: int, fail_n: int, cancelled: bool):
+        """완료 알림: 화면 우하단 토스트 (3초 후 자동으로 사라짐)"""
+        body = f"총 {total}개 / 성공 {success_n} / 실패 {fail_n}"
+        if cancelled:
+            title, level = "처리가 취소되었습니다", "warning"
+        elif fail_n > 0:
+            title, level = "처리 완료 (일부 실패)", "error"
+            body += "\n실패 내역은 보기 > 처리 로그에서 확인하세요."
+        else:
+            title, level = "처리 완료", "success"
+        ToastNotification.show_toast(title, body, level, duration_ms=3000,
+                                     on_click=self._bring_to_front)
+        if not self.isActiveWindow():
+            QApplication.alert(self, 3000)   # 작업표시줄 버튼 깜빡임
+
+    def _bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     # ---------------- 메타 정보 / 로그 ----------------
     def _on_check_log(self, msg: str):
@@ -2461,12 +3327,20 @@ class MainWindow(QMainWindow):
                 if it:
                     sz = meta.get("size", 0)
                     dur = meta.get("duration", 0)
-                    it.setText(COL_SIZE,     self._fmt_size(sz))
+                    w  = int(meta.get("w", 0)); h = int(meta.get("h", 0))
+                    vc = meta.get("vc", "");    ac = meta.get("ac", "")
+                    br = meta.get("br", 0)
+                    codecs = " / ".join([c for c in (vc, ac) if c])
+                    it.setText(COL_RES,      f"{w}x{h}" if (w and h) else "-")
+                    it.setText(COL_CODEC,    codecs if codecs else "-")
+                    it.setText(COL_BITRATE,  self._fmt_bitrate(br))
                     it.setText(COL_DURATION, self._fmt_dur(dur))
+                    it.setText(COL_SIZE,     self._fmt_size(sz))
                     if dur > 0 or sz > 0:
                         tip = (f"경로: {p}\n"
-                               f"비디오: {meta.get('vc','?')} {meta.get('w','?')}x{meta.get('h','?')}\n"
-                               f"오디오: {meta.get('ac','?')}\n"
+                               f"비디오: {vc} {w}x{h}\n"
+                               f"오디오: {ac}\n"
+                               f"비트레이트: {self._fmt_bitrate(br)}\n"
                                f"FastStart: {meta.get('fs')} / Hint: {meta.get('ht')}")
                         it.setToolTip(COL_NAME, tip)
             except Exception:
@@ -2493,12 +3367,15 @@ class MainWindow(QMainWindow):
         item = self.tree.itemAt(pos)
         if not item: return
         m = QMenu(self)
+        a_diag = m.addAction("📊 파일 진단")
         a_open = m.addAction("📁 폴더 열기")
         a_copy = m.addAction("📋 경로 복사")
         a_retry = m.addAction("🔁 재처리")
         a_remove = m.addAction("🗑 목록에서 제거")
         act = m.exec_(self.tree.viewport().mapToGlobal(pos))
-        if act == a_open:
+        if act == a_diag:
+            DiagnosticDialog(item.text(COL_PATH), self).exec_()
+        elif act == a_open:
             self._open_in_explorer(item.text(COL_PATH))
         elif act == a_copy:
             QApplication.clipboard().setText(item.text(COL_PATH))
@@ -2514,7 +3391,19 @@ class MainWindow(QMainWindow):
             if self._processing_active:
                 QMessageBox.information(self, "알림", "처리 중에는 제거할 수 없습니다.")
             else:
-                self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(item))
+                self._take_item(item)
+
+    def _on_diagnose(self):
+        """선택된 항목 또는 파일 다이얼로그로 진단"""
+        sel = self.tree.selectedItems()
+        if sel:
+            DiagnosticDialog(sel[0].text(COL_PATH), self).exec_()
+            return
+        start = self.cfg.recent_dirs[0] if self.cfg.recent_dirs else ""
+        f, _ = QFileDialog.getOpenFileName(self, "진단할 MP4 선택", start,
+                                            "MP4 Files (*.mp4);;All Files (*)")
+        if f:
+            DiagnosticDialog(f, self).exec_()
 
     def _on_item_double_clicked(self, item, _col):
         status = item.text(COL_STATUS)
@@ -2554,6 +3443,19 @@ class MainWindow(QMainWindow):
         s = float(s or 0)
         if s <= 0: return "-"
         return str(timedelta(seconds=int(s)))
+
+    @staticmethod
+    def _fmt_bitrate(bps) -> str:
+        try:
+            bps = float(bps or 0)
+        except (TypeError, ValueError):
+            return "-"
+        if bps <= 0: return "-"
+        if bps >= 1_000_000:
+            return f"{bps/1_000_000:.2f} Mbps"
+        if bps >= 1000:
+            return f"{bps/1000:.0f} kbps"
+        return f"{int(bps)} bps"
 
     def _toggle_buttons(self, processing: bool):
         self.btn_add.setEnabled(not processing)
@@ -2596,6 +3498,10 @@ class MainWindow(QMainWindow):
             while self._processing_active and time.monotonic() - t0 < 5:
                 QApplication.processEvents()
                 time.sleep(0.05)
+            self.pool.waitForDone(3000)
+        self.check_pool.clear()
+        for t in list(ToastNotification._active):
+            t.close()
         self.settings.save()
         e.accept()
 
@@ -2633,7 +3539,8 @@ def main():
     if sys.platform == "win32":
         try:
             import ctypes
-            myappid = f"{APP_ORG}.{APP_NAME}.{APP_VERSION}"
+            # 설치 프로그램이 만든 바로가기의 AppUserModelID 와 같아야 함 (버전과 무관하게 고정)
+            myappid = APP_USER_MODEL_ID
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
