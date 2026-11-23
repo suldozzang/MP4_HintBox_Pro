@@ -1960,11 +1960,24 @@ class _ActiveClock:
 # =====================================================================
 #  Worker  (단일 파일 처리)
 # =====================================================================
+# 작업(QRunnable)이 끝나며 신호 객체가 먼저 지워지면 아직 전달되지 않은 신호가
+# 사라질 수 있음 (PySide6 에서 실제로 발생). 마지막 신호 뒤 2초간 참조를 붙잡아 둔다.
+_ALIVE_SIGNALS: set = set()
+
+
 class WorkerSignals(QObject):
     state    = pyqtSignal(str, str)         # (path, TaskState.value)
     progress = pyqtSignal(str, float, float, float)  # (path, pct, eta, speed)
     log      = pyqtSignal(str)
     finished = pyqtSignal(str, bool, str)   # (path, success, msg)
+
+    def __init__(self, last: str = "finished"):
+        super().__init__()
+        _ALIVE_SIGNALS.add(self)
+        getattr(self, last).connect(self._release)
+
+    def _release(self, *_args):
+        QTimer.singleShot(2000, lambda: _ALIVE_SIGNALS.discard(self))
 
 
 TEMP_PREFIX = ".mp4hb_"
@@ -2278,7 +2291,7 @@ class CheckWorker(QRunnable):
         self.filepath = filepath
         self.engine = engine
         self.ffprobe = ffprobe
-        self.signals = WorkerSignals()
+        self.signals = WorkerSignals(last="state")
 
     def run(self):
         try:
@@ -2382,13 +2395,13 @@ class DnDTreeWidget(QTreeWidget):
         self._drag_active = False
 
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
-            urls = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
-            if any(p.lower().endswith(".mp4") or os.path.isdir(p) for p in urls):
-                e.acceptProposedAction()
-                self._drag_active = True
-                self.viewport().update()
-                return
+        # 로컬 파일/폴더가 하나라도 있으면 받는다. MP4 인지는 놓은 뒤 판단해서 안내
+        # (예전에는 MP4 가 없으면 조용히 거부해 "끌어 놓기가 고장났다"고 느껴졌음)
+        if e.mimeData().hasUrls() and any(u.isLocalFile() for u in e.mimeData().urls()):
+            e.acceptProposedAction()
+            self._drag_active = True
+            self.viewport().update()
+            return
         e.ignore()
 
     def dragMoveEvent(self, e):
@@ -3022,9 +3035,30 @@ class MainWindow(QMainWindow):
         if d:
             self._on_paths_dropped([d])
 
+    @staticmethod
+    def _skipped_text(skipped: Dict[str, int], prefix: str = "") -> str:
+        """{"MKV": 2, "SRT": 1} → "MKV 2개, SRT 1개" (없으면 빈 문자열)"""
+        if not skipped:
+            return ""
+        return prefix + ", ".join(f"{ext} {n}개" for ext, n in
+                                  sorted(skipped.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    def _notify_no_mp4(self, skipped: Dict[str, int], had_dirs: bool):
+        """추가된 MP4 가 하나도 없을 때 이유를 알려 준다 (아무 반응이 없으면 고장으로 오해함)"""
+        if skipped:
+            QMessageBox.information(
+                self, "MP4 파일만 처리합니다",
+                "MP4 파일만 추가할 수 있습니다.\n\n"
+                f"제외한 파일: {self._skipped_text(skipped)}\n\n"
+                "MKV 등은 MP4 로 바꾼 뒤 추가해 주세요. "
+                "(faststart 는 MP4 형식에만 있는 처리입니다)")
+        elif had_dirs:
+            QMessageBox.information(self, "MP4 파일 없음", "고른 폴더 안에 MP4 파일이 없습니다.")
+
     def _on_paths_dropped(self, paths: List[str]):
         files: List[str] = []
         dirs_seen: List[str] = []
+        skipped: Dict[str, int] = {}       # MP4 가 아니라 제외한 파일 (확장자별 개수)
         for p in paths:
             try:
                 if os.path.isdir(p):
@@ -3035,6 +3069,9 @@ class MainWindow(QMainWindow):
                                 files.append(os.path.join(root, fn))
                 elif os.path.isfile(p) and p.lower().endswith(".mp4") and not is_temp_artifact(p):
                     files.append(p)
+                elif os.path.isfile(p) and not is_temp_artifact(p):
+                    ext = os.path.splitext(p)[1].lstrip(".").upper() or "확장자 없음"
+                    skipped[ext] = skipped.get(ext, 0) + 1
             except Exception as e:
                 self._log(f"경로 스캔 오류 {p}: {e}")
 
@@ -3047,7 +3084,8 @@ class MainWindow(QMainWindow):
             self.settings.save()
 
         if not files:
-            self._log("추가할 MP4 파일이 없습니다.")
+            self._log("추가할 MP4 파일이 없습니다." + self._skipped_text(skipped, " / 제외(MP4 아님): "))
+            self._notify_no_mp4(skipped, bool(dirs_seen))
             return
 
         # 기존 경로도 동일한 정규화 규칙으로 비교
@@ -3070,7 +3108,11 @@ class MainWindow(QMainWindow):
             added += 1
             # 비동기 메타 체크
             self._start_check(f, self._current_engine())
-        self._log(f"파일 추가: {added}개 / 중복 제외: {dup}개")
+        self._log(f"파일 추가: {added}개 / 중복 제외: {dup}개"
+                  + self._skipped_text(skipped, " / 제외(MP4 아님): "))
+        if skipped and not self._processing_active:
+            self.lbl_progress.setText(f"MP4 {added}개 추가 · MP4 가 아니라 제외: "
+                                      + self._skipped_text(skipped))
 
     def _start_check(self, path: str, engine: str):
         cw = CheckWorker(path, engine, self.ffprobe_path)
